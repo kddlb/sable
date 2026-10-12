@@ -20,7 +20,10 @@ path = "src/gui/main.rs"
 required-features = ["gui"]
 
 [features]
-default = []
+# Compressed/other container decoding (FLAC, MP3, Ogg Vorbis, AAC/ALAC in MP4/M4A, AIFF,
+# CAF, MKV/WebM audio) via symphonia. WAV always uses hound.
+default = ["decode"]
+decode = ["dep:symphonia"]
 # Desktop GUI (egui/eframe) with file dialogs and audio playback.
 gui = ["dep:eframe", "dep:egui_extras", "dep:egui-twemoji", "dep:twemoji-assets", "dep:rfd", "dep:cpal"]
 
@@ -29,6 +32,7 @@ sable-core = { path = "../sable-core" }
 hound.workspace = true
 clap.workspace = true
 serde_json.workspace = true
+symphonia = { version = "0.6", optional = true, default-features = false, features = ["all", "opt-simd"] }
 # egui stack pinned to 0.33: egui-twemoji 0.8 (latest) targets egui 0.33.
 eframe = { version = "0.33", optional = true }
 egui_extras = { version = "0.33", optional = true, default-features = false, features = ["svg"] }

@@ -55,7 +55,31 @@ target/release/sable -i speech.wav -o faster.wav -s 0.75 --seed 42 \
 | `--quality fast\|standard\|high` | WSOLA grain/search presets |
 | `--format float32\|pcm16\|pcm24` | output format. The default float32 neither clips nor quantizes. Integer formats round and clip to `[-1, 1)` with **no dither**. |
 | `--no-plosive`, `--no-sibilant` | disable a special renderer |
+| `--skip-leading-silence` | drop silence before the first sound, keeping a 20 ms pre-roll (`--silence-threshold-db`, default −50 dBFS RMS on the loudest channel; `--silence-preroll-ms`). The exact output length then applies to the **trimmed** input, and the skipped frame count is printed and stored under `input` in the diagnostics JSON. |
 | `--generic` | uniform generic WSOLA with all speech handling off (comparison baseline) |
+
+### Input formats
+
+WAV is read with `hound`. With the default `decode` feature, other formats are decoded in
+pure Rust by `symphonia` 0.6. Output is always WAV.
+
+| container / codec | status |
+|---|---|
+| WAV (PCM 8–32-bit, float 32/64, ADPCM) | ✔ (hound; symphonia fallback for encodings hound cannot read) |
+| FLAC, ALAC (`.m4a`), AIFF, CAF, MKV/WebM (`.mka`) | ✔ lossless; verified bit-exact against the source WAV |
+| MP3 (MP1/MP2), Ogg Vorbis, AAC-LC (`.m4a`/`.mp4`/`.aac`) | ✔ lossy, see below |
+| Opus | ✘ no pure-Rust decoder in symphonia; returns an error |
+
+Inputs with more than two channels are rejected rather than downmixed.
+`cargo build -p sable-cli --no-default-features` gives a WAV-only build.
+
+> **Lossy MP3/AAC and exact duration.** Encoders add delay and padding (often 1000–2000
+> samples). symphonia removes MP3 padding only when the file records it (LAME/Xing
+> header), and it does not remove AAC padding. The decoded input can therefore be longer than
+> the original recording, and SABLE's exact frame count applies to the *decoded* signal.
+> In a test, an AAC `.m4a` decoded 1,381 frames longer than its source. The MP3 (with a
+> LAME header) and Ogg Vorbis decoded to the exact length. The CLI prints a note for
+> MP3/AAC inputs, and the GUI shows one. Use WAV or FLAC when exact duration matters.
 
 The CLI prints source, target and actual frame counts, the achieved factor, the
 allocator stage, and every warning. Stereo is never downmixed; more than 2 channels is an
@@ -72,7 +96,9 @@ cargo run --release -p sable-cli --features gui --bin sable-gui
 cargo run --release -p sable-cli --features gui --bin sable-gui -- speech.wav 3/2
 ```
 
-* Open a WAV (button or drag-and-drop). The analyzer runs in the background, and event
+* Open any supported audio file (button or drag-and-drop). MP3/AAC files show a
+  padding note. "Skip leading silence" (with a threshold) trims the start before
+  processing, and the skipped region is shaded in the original lane. The analyzer runs in the background, and event
   classes are shown as coloured bands over the waveform.
 * Set the factor (`p/q` or decimal, with presets), seed, quality, and which renderers are
   enabled, or pick generic WSOLA for comparison. Processing runs on a worker thread.

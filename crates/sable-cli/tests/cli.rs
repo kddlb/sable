@@ -150,3 +150,129 @@ fn rejects_bad_ratio_and_multichannel() {
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("no automatic downmix"));
 }
+
+/// Hand-written 16-bit big-endian PCM AIFF (exercises the symphonia decode path).
+#[cfg(feature = "decode")]
+fn write_aiff(path: &Path, channels: u16, frames: u32, samples: impl Fn(u32, u16) -> i16) {
+    let mut ssnd = Vec::new();
+    ssnd.extend_from_slice(&0u32.to_be_bytes()); // offset
+    ssnd.extend_from_slice(&0u32.to_be_bytes()); // block size
+    for i in 0..frames {
+        for c in 0..channels {
+            ssnd.extend_from_slice(&samples(i, c).to_be_bytes());
+        }
+    }
+    let mut comm = Vec::new();
+    comm.extend_from_slice(&channels.to_be_bytes());
+    comm.extend_from_slice(&frames.to_be_bytes());
+    comm.extend_from_slice(&16u16.to_be_bytes());
+    // 48000 Hz as an 80-bit IEEE extended float.
+    comm.extend_from_slice(&[0x40, 0x0E, 0xBB, 0x80, 0, 0, 0, 0, 0, 0]);
+    let mut body = b"AIFF".to_vec();
+    for (id, data) in [(b"COMM", &comm), (b"SSND", &ssnd)] {
+        body.extend_from_slice(id);
+        body.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        body.extend_from_slice(data);
+    }
+    let mut file = b"FORM".to_vec();
+    file.extend_from_slice(&(body.len() as u32).to_be_bytes());
+    file.extend_from_slice(&body);
+    std::fs::write(path, file).unwrap();
+}
+
+#[cfg(feature = "decode")]
+#[test]
+fn decodes_aiff_bit_exactly() {
+    let d = tmp_dir("aiff");
+    let input = d.join("in.aiff");
+    let output = d.join("out.wav");
+    let sample = |i: u32, c: u16| ((i as i32 * 37 + c as i32 * 1000) % 20000 - 10000) as i16;
+    write_aiff(&input, 2, 4800, sample);
+    let out = sable(&[
+        "-i",
+        input.to_str().unwrap(),
+        "-o",
+        output.to_str().unwrap(),
+        "-s",
+        "1",
+        "--format",
+        "pcm16",
+    ]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let mut r = hound::WavReader::open(&output).unwrap();
+    assert_eq!(r.spec().channels, 2);
+    assert_eq!(r.spec().sample_rate, 48_000);
+    let got: Vec<i16> = r.samples::<i16>().map(Result::unwrap).collect();
+    let want: Vec<i16> = (0..4800)
+        .flat_map(|i| [sample(i, 0), sample(i, 1)])
+        .collect();
+    assert_eq!(got, want);
+}
+
+#[test]
+fn unsupported_extension_is_a_clear_error() {
+    let d = tmp_dir("ext");
+    let input = d.join("in.xyz");
+    std::fs::write(&input, b"not audio").unwrap();
+    let out = sable(&[
+        "-i",
+        input.to_str().unwrap(),
+        "-o",
+        d.join("o.wav").to_str().unwrap(),
+        "-s",
+        "2",
+    ]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("supported extensions"));
+}
+
+#[test]
+fn skips_leading_silence_before_stretching() {
+    let d = tmp_dir("skip");
+    let input = d.join("in.wav");
+    let output = d.join("out.wav");
+    let diag = d.join("d.json");
+    // 0.5 s of digital silence, then 0.5 s of tone at 16 kHz.
+    let spec = hound::WavSpec {
+        channels: 1,
+        sample_rate: 16_000,
+        bits_per_sample: 32,
+        sample_format: hound::SampleFormat::Float,
+    };
+    let mut w = hound::WavWriter::create(&input, spec).unwrap();
+    for i in 0..16_000 {
+        let v = if i < 8_000 {
+            0.0
+        } else {
+            ((i as f32) * 0.05).sin() * 0.3
+        };
+        w.write_sample(v).unwrap();
+    }
+    w.finalize().unwrap();
+    let out = sable(&[
+        "-i",
+        input.to_str().unwrap(),
+        "-o",
+        output.to_str().unwrap(),
+        "-s",
+        "2",
+        "--skip-leading-silence",
+        "--diagnostics",
+        diag.to_str().unwrap(),
+    ]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // Onset at 8000 minus 20 ms pre-roll (320 frames) -> 7680 skipped, 8320 remain -> 16640 out.
+    let json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&diag).unwrap()).unwrap();
+    assert_eq!(json["input"]["skipped_leading_frames"], 7_680);
+    assert_eq!(json["n_in"], 8_320);
+    assert_eq!(hound::WavReader::open(&output).unwrap().duration(), 16_640);
+}

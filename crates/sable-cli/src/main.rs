@@ -1,4 +1,4 @@
-//! `sable`: WAV front end for the SABLE speech time stretcher.
+//! `sable`: command-line front end for the SABLE speech time stretcher.
 
 #![forbid(unsafe_code)]
 
@@ -6,7 +6,9 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, ValueEnum};
-use sable_cli::wav::{Format, read_wav, write_wav};
+use sable_cli::trim::SilenceTrim;
+use sable_cli::wav::{Format, write_wav};
+use sable_cli::{load_input, may_have_encoder_padding, supported_extensions};
 use sable_core::{AudioView, Options, QualityPreset, StretchRatio, stretch};
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -20,7 +22,8 @@ enum Quality {
 #[derive(Parser, Debug)]
 #[command(name = "sable", version)]
 struct Cli {
-    /// Input WAV file (mono or stereo; integer or float PCM).
+    /// Input audio file, mono or stereo: WAV (integer/float PCM) and, with the default
+    /// `decode` feature, FLAC, MP3, Ogg Vorbis, M4A/MP4 (AAC, ALAC), AIFF, CAF, MKV/WebM.
     #[arg(long, short)]
     input: PathBuf,
     /// Output WAV file.
@@ -55,6 +58,16 @@ struct Cli {
     /// Write intermediate layers (baseline, overlays, masks) as WAVs into this directory.
     #[arg(long)]
     dump_dir: Option<PathBuf>,
+    /// Drop leading silence from the input before stretching (keeps a short pre-roll).
+    /// The exact output length then applies to the trimmed input.
+    #[arg(long)]
+    skip_leading_silence: bool,
+    /// Level (dBFS RMS, loudest channel) treated as sound by --skip-leading-silence.
+    #[arg(long, default_value_t = SilenceTrim::default().threshold_db, allow_negative_numbers = true)]
+    silence_threshold_db: f64,
+    /// Audio kept before the first sound by --skip-leading-silence, in milliseconds.
+    #[arg(long, default_value_t = SilenceTrim::default().preroll_ms)]
+    silence_preroll_ms: f64,
 }
 
 fn main() -> ExitCode {
@@ -69,7 +82,23 @@ fn main() -> ExitCode {
 
 fn run(cli: Cli) -> Result<(), String> {
     let ratio = StretchRatio::parse(&cli.stretch).map_err(|e| e.to_string())?;
-    let input = read_wav(&cli.input)?;
+    let trim = cli.skip_leading_silence.then(|| SilenceTrim {
+        threshold_db: cli.silence_threshold_db,
+        preroll_ms: cli.silence_preroll_ms.max(0.0),
+        ..SilenceTrim::default()
+    });
+    let (input, skipped) = load_input(&cli.input, trim.as_ref()).map_err(|e| {
+        format!(
+            "{e}
+(supported extensions: {})",
+            supported_extensions().join(", ")
+        )
+    })?;
+    if may_have_encoder_padding(&cli.input) {
+        eprintln!(
+            "note: lossy MP3/AAC input may include encoder padding (silence) that the decoder cannot remove; the exact frame count applies to the decoded signal"
+        );
+    }
     let mut opts = if cli.generic {
         Options::generic_wsola()
     } else {
@@ -99,6 +128,12 @@ fn run(cli: Cli) -> Result<(), String> {
         "sample rate    {} Hz, {} channel(s)",
         r.sample_rate, r.channels
     );
+    if cli.skip_leading_silence {
+        println!(
+            "skipped        {skipped} leading frames ({:.1} ms of silence)",
+            skipped as f64 * 1000.0 / r.sample_rate as f64
+        );
+    }
     println!("source frames  {}", r.n_in);
     println!("target frames  {}", r.n_out);
     println!("actual frames  {actual}");
@@ -123,7 +158,20 @@ fn run(cli: Cli) -> Result<(), String> {
     }
     write_wav(&cli.output, &result.audio, cli.format)?;
     if let Some(p) = &cli.diagnostics {
-        let json = serde_json::to_string_pretty(&result.report).map_err(|e| e.to_string())?;
+        let mut value = serde_json::to_value(&result.report).map_err(|e| e.to_string())?;
+        if let Some(obj) = value.as_object_mut() {
+            obj.insert(
+                "input".into(),
+                serde_json::json!({
+                    "path": cli.input.display().to_string(),
+                    "skip_leading_silence": cli.skip_leading_silence,
+                    "skipped_leading_frames": skipped,
+                    "silence_threshold_db": cli.silence_threshold_db,
+                    "silence_preroll_ms": cli.silence_preroll_ms,
+                }),
+            );
+        }
+        let json = serde_json::to_string_pretty(&value).map_err(|e| e.to_string())?;
         std::fs::write(p, json).map_err(|e| format!("{}: {e}", p.display()))?;
     }
     if let (Some(dir), Some(layers)) = (&cli.dump_dir, &result.layers) {

@@ -50,6 +50,8 @@ pub struct Lane<'a> {
     pub masks: Option<(&'a [f32], &'a [f32])>,
     pub playhead: Option<f64>,
     pub cursor: Option<f64>,
+    /// Frame range drawn dimmed (e.g. skipped leading silence).
+    pub shade: Option<(f64, f64)>,
     pub dim: bool,
 }
 
@@ -200,6 +202,22 @@ impl Lane<'_> {
                 tick,
             );
             t += step;
+        }
+
+        // Dimmed range (skipped leading silence).
+        if let Some((a, b)) = self.shade
+            && b > v0
+            && a < v1
+        {
+            let r = Rect::from_x_y_ranges(x_of(a.max(v0))..=x_of(b.min(v1)), rect.y_range());
+            painter.rect_filled(r, 0.0, Color32::from_black_alpha(150));
+            painter.text(
+                r.center_bottom() - Vec2::new(0.0, 18.0),
+                Align2::CENTER_BOTTOM,
+                "skipped",
+                FontId::proportional(11.0),
+                visuals.weak_text_color(),
+            );
         }
 
         // Cursor and playhead.

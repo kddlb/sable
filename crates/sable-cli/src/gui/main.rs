@@ -17,7 +17,9 @@ use std::sync::mpsc::{Receiver, channel};
 use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Color32, RichText};
-use sable_cli::wav::{Format, read_wav, write_wav};
+use sable_cli::trim::{SilenceTrim, leading_silence_frames, skip_frames};
+use sable_cli::wav::{Format, write_wav};
+use sable_cli::{may_have_encoder_padding, read_audio, supported_extensions};
 use sable_core::detect::BurstCandidate;
 use sable_core::segments::{EventKind, Segment};
 use sable_core::{
@@ -69,6 +71,8 @@ struct Settings {
     plosive: bool,
     sibilant: bool,
     generic: bool,
+    skip_silence: bool,
+    silence_db: f64,
 }
 
 impl Settings {
@@ -91,6 +95,8 @@ struct Done {
     result: Arc<ProcessResult>,
     settings: Settings,
     elapsed: Duration,
+    /// Leading input frames dropped before stretching (skip-silence option).
+    skipped: usize,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -136,12 +142,14 @@ impl App {
                 plosive: true,
                 sibilant: true,
                 generic: false,
+                skip_silence: false,
+                silence_db: SilenceTrim::default().threshold_db,
             },
             format: Format::Float32,
             analyze_rx: None,
             process_rx: None,
             done: None,
-            status: "Open a mono or stereo WAV file (or drop one onto the window).".into(),
+            status: "Open a mono or stereo audio file (WAV, FLAC, MP3, Ogg, M4A, AIFF, …) or drop one onto the window.".into(),
             error: None,
             player: Player::new(),
             view: (0.0, 1.0),
@@ -161,7 +169,7 @@ impl App {
     }
 
     fn open(&mut self, path: &Path, ctx: &egui::Context) {
-        match read_wav(path) {
+        match read_audio(path) {
             Ok(audio) => {
                 if let Ok(p) = &self.player {
                     p.stop();
@@ -208,12 +216,26 @@ impl App {
         let (Some(input), Ok(ratio)) = (&self.input, self.ratio()) else {
             return;
         };
-        let audio = input.audio.clone();
+        let full = input.audio.clone();
         let settings = self.settings.clone();
         let (tx, rx) = channel();
         let ctx2 = ctx.clone();
         std::thread::spawn(move || {
             let t = Instant::now();
+            let skipped = if settings.skip_silence {
+                let cfg = SilenceTrim {
+                    threshold_db: settings.silence_db,
+                    ..SilenceTrim::default()
+                };
+                leading_silence_frames(&full, &cfg)
+            } else {
+                0
+            };
+            let audio = if skipped > 0 {
+                Arc::new(skip_frames(&full, skipped))
+            } else {
+                full
+            };
             let refs = audio.view_refs();
             let view = AudioView {
                 sample_rate: audio.sample_rate,
@@ -224,6 +246,7 @@ impl App {
                     result: Arc::new(result),
                     settings,
                     elapsed: t.elapsed(),
+                    skipped,
                 })
                 .map_err(|e| e.to_string());
             let _ = tx.send(r);
@@ -275,6 +298,7 @@ impl App {
     /// Piecewise-linear input→output frame map from the report's segment table.
     fn in_to_out(&self, x: f64) -> f64 {
         let Some(d) = &self.done else { return x };
+        let x = x - d.skipped as f64;
         let segs = &d.result.report.segments;
         for s in segs {
             let (a, l) = (s.in_start as f64, s.in_len as f64);
@@ -293,10 +317,10 @@ impl App {
             let (o, d_) = (s.out_start as f64, s.out_len as f64);
             if y < o + d_ || std::ptr::eq(s, segs.last().unwrap()) {
                 let v = (y - o) / d_.max(1.0);
-                return s.in_start as f64 + v * s.in_len as f64;
+                return d.skipped as f64 + s.in_start as f64 + v * s.in_len as f64;
             }
         }
-        y
+        y + d.skipped as f64
     }
 
     fn input_segments(&self) -> Option<Vec<SegRow>> {
@@ -307,9 +331,10 @@ impl App {
                     .segments
                     .iter()
                     .map(|s| {
+                        let off = d.skipped as u64;
                         (
-                            s.in_start,
-                            s.in_start + s.in_len,
+                            off + s.in_start,
+                            off + s.in_start + s.in_len,
                             s.kind,
                             s.confidence,
                             s.reasons.clone(),
@@ -353,9 +378,10 @@ impl App {
     fn top_bar(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         ui.horizontal(|ui| {
-            if ui.add(emoji_button("📂", "Open WAV…")).clicked()
+            if ui.add(emoji_button("📂", "Open audio…")).clicked()
                 && let Some(p) = rfd::FileDialog::new()
-                    .add_filter("WAV audio", &["wav"])
+                    .add_filter("Audio", supported_extensions())
+                    .add_filter("WAV", &["wav", "wave"])
                     .pick_file()
             {
                 self.open(&p, &ctx);
@@ -378,6 +404,13 @@ impl App {
                     a.frames(),
                     a.frames() as f64 / a.sample_rate as f64
                 ));
+                if may_have_encoder_padding(&inp.path) {
+                    emoji_label(ui, "⚠️");
+                    ui.label(RichText::new("lossy MP3/AAC: may include encoder padding").weak())
+                        .on_hover_text(
+                            "The decoder cannot always remove MP3/AAC encoder delay and padding,                              so the decoded length can exceed the original recording. The exact                              frame count applies to the decoded signal. Use WAV/FLAC when exact                              duration matters.",
+                        );
+                }
                 if self.analyze_rx.is_some() {
                     ui.add(egui::Spinner::new());
                     ui.label("analyzing…");
@@ -445,6 +478,21 @@ impl App {
             ui.add_enabled_ui(!self.settings.generic, |ui| {
                 ui.checkbox(&mut self.settings.plosive, "Protect plosive bursts");
                 ui.checkbox(&mut self.settings.sibilant, "Resynthesize sibilants");
+            });
+            ui.checkbox(&mut self.settings.skip_silence, "Skip leading silence")
+                .on_hover_text(
+                    "Drop silence before the first sound (keeping 20 ms) before stretching.                      The exact output length then applies to the trimmed input.",
+                );
+            ui.add_enabled_ui(self.settings.skip_silence, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Threshold");
+                    ui.add(
+                        egui::DragValue::new(&mut self.settings.silence_db)
+                            .range(-90.0..=-10.0)
+                            .speed(0.5)
+                            .suffix(" dBFS"),
+                    );
+                });
             });
             ui.horizontal(|ui| {
                 ui.label("Quality");
@@ -676,7 +724,7 @@ impl App {
         let Some(inp) = &self.input else {
             ui.centered_and_justified(|ui| {
                 ui.label(
-                    RichText::new("Drop a WAV file here or use “Open WAV…”")
+                    RichText::new("Drop an audio file here or use “Open audio…”")
                         .size(18.0)
                         .weak(),
                 );
@@ -713,6 +761,11 @@ impl App {
             masks: None,
             playhead: playing.filter(|p| p.0 == Source::Original).map(|p| p.1),
             cursor: Some(self.cursor),
+            shade: self
+                .done
+                .as_ref()
+                .filter(|d| d.skipped > 0)
+                .map(|d| (0.0, d.skipped as f64)),
             dim: false,
         }
         .show(ui, lane_h);
@@ -755,6 +808,7 @@ impl App {
                 masks,
                 playhead: playing.filter(|p| p.0 == Source::Result).map(|p| p.1),
                 cursor: Some(self.in_to_out(self.cursor)),
+                shade: None,
                 dim: false,
             }
             .show(ui, lane_h);
@@ -927,6 +981,17 @@ impl App {
                             ui.label(w.uncovered_filled.to_string());
                             ui.end_row();
                         }
+                        ui.label("skipped silence");
+                        ui.label(if d.skipped > 0 {
+                            format!(
+                                "{} frames ({:.1} ms)",
+                                d.skipped,
+                                d.skipped as f64 * 1000.0 / r.sample_rate as f64
+                            )
+                        } else {
+                            "none".into()
+                        });
+                        ui.end_row();
                         ui.label("time");
                         ui.label(format!("{:.0} ms", d.elapsed.as_secs_f64() * 1000.0));
                         ui.end_row();
