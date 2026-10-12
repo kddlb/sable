@@ -6,6 +6,7 @@ use crate::detect::{EventDetector, HeuristicDetector};
 use crate::error::StretchError;
 use crate::features::{self, FeatureConfig, Features};
 use crate::options::{Options, StereoMode};
+use crate::progress::{Phase, Progress};
 use crate::ratio::StretchRatio;
 use crate::report::{AnalysisReport, FeatureDump, RenderPath, SegmentReport, Warning};
 use crate::segments::{EventKind, Segment, coalesce_to_count, renumber, validate_partition};
@@ -196,6 +197,27 @@ fn ms_to_lr(mut ms: Vec<Vec<f32>>) -> Vec<Vec<f32>> {
     vec![l, r]
 }
 
+/// Output of [`render`].
+pub struct Rendered {
+    /// Exactly `n_out` frames per channel.
+    pub channels: Vec<Vec<f32>>,
+    pub layers: Option<Layers>,
+    /// Upper voiced F0 of the input (85th percentile), clamped to 80–400 Hz; 200 Hz when
+    /// nothing is voiced. Sets the envelope lifter for formant-preserving pitch shifts.
+    pub f0_ref_hz: f64,
+}
+
+/// 85th percentile of the voiced F0 track, clamped to a sane speech range.
+fn f0_reference(f: &Features) -> f64 {
+    let mut v: Vec<f32> = f.f0_hz.iter().copied().filter(|&x| x > 0.0).collect();
+    if v.is_empty() {
+        return 200.0;
+    }
+    v.sort_by(f32::total_cmp);
+    let i = ((v.len() - 1) as f64 * 0.85).round() as usize;
+    (v[i] as f64).clamp(80.0, 400.0)
+}
+
 /// Full rendering path. Returns exactly `n_out` frames per channel.
 pub fn render(
     input: &AudioView<'_>,
@@ -203,14 +225,28 @@ pub fn render(
     n_out: u64,
     opts: &Options,
     report: &mut AnalysisReport,
-) -> Result<(Vec<Vec<f32>>, Option<Layers>), StretchError> {
+    progress: &mut Progress<'_>,
+) -> Result<Rendered, StretchError> {
     let fs = input.sample_rate;
     let n_in = input.frames() as u64;
     let r = ratio.as_f64();
+    progress.start(Phase::Analysis);
     let feats = features::analyze(input.channels, fs, &FeatureConfig::default());
     if opts.diagnostics {
         report.features = Some(feature_dump(&feats));
     }
+    let f0_ref_hz = f0_reference(&feats);
+    let voiced = feats.f0_hz.iter().filter(|&&f| f > 0.0).count();
+    progress.finish(
+        Phase::Analysis,
+        format!(
+            "{} frames, {:.0}% voiced, F0 ref {:.0} Hz",
+            feats.f0_hz.len(),
+            100.0 * voiced as f64 / feats.f0_hz.len().max(1) as f64,
+            f0_ref_hz
+        ),
+    );
+    progress.start(Phase::Detection);
     let segments = if opts.uniform_timing {
         let mut s = Segment::new(0, n_in, EventKind::Other, 1.0);
         s.reasons
@@ -232,7 +268,28 @@ pub fn render(
         det.segments
     };
     validate_partition(&segments, n_in).map_err(StretchError::Internal)?;
+    if progress.active() {
+        let count = |f: fn(EventKind) -> bool| segments.iter().filter(|s| f(s.kind)).count();
+        progress.finish(
+            Phase::Detection,
+            format!(
+                "{} segments: {} bursts, {} sibilants, {} voiced",
+                segments.len(),
+                count(|k| k == EventKind::PlosiveBurst),
+                count(EventKind::is_sibilant),
+                count(|k| k == EventKind::Voiced)
+            ),
+        );
+    }
+    progress.start(Phase::Allocation);
     let plan = plan(segments, n_in, n_out, r, opts, report);
+    progress.finish(
+        Phase::Allocation,
+        match plan.stage {
+            Some(st) => format!("stage {st:?}, {} anchored bursts", plan.anchored.len()),
+            None => "uniform map".to_string(),
+        },
+    );
     report.allocator_stage = plan.stage;
     report.path = if plan.stage.is_some() && !opts.uniform_timing {
         RenderPath::Full
@@ -288,7 +345,22 @@ pub fn render(
         })
         .collect();
     let cfg = WsolaConfig::new(fs, opts.quality);
-    let base = wsola::render(work.channels, &feats.mono, &plan.map, &anchors, &cfg);
+    progress.start(Phase::Wsola);
+    let base = wsola::render(
+        work.channels,
+        &feats.mono,
+        &plan.map,
+        &anchors,
+        &cfg,
+        &mut |d, t| progress.step(Phase::Wsola, d, t),
+    );
+    progress.finish(
+        Phase::Wsola,
+        format!(
+            "{} grains ({} transient)",
+            base.stats.grains, base.stats.transient_grains
+        ),
+    );
     if base.stats.uncovered_filled > 0 {
         report.warnings.push(Warning::UncoveredSamplesFilled {
             count: base.stats.uncovered_filled,
@@ -299,10 +371,20 @@ pub fn render(
 
     // Plosive overlays at fixed coordinates.
     let mut out = baseline.clone();
+    progress.start(Phase::Plosives);
     let plos = plosives::apply(&special, &plan, opts, &mut out[..n_special], report);
+    progress.finish(
+        Phase::Plosives,
+        format!(
+            "{} of {} bursts copied",
+            report.plosive_overlays.iter().filter(|o| o.applied).count(),
+            report.plosive_overlays.len()
+        ),
+    );
     let after_plosive = opts.keep_layers.then(|| out.clone());
 
     // Sibilant overlays at fixed coordinates.
+    progress.start(Phase::Sibilants);
     let sib = sibilants::apply(
         &special,
         &feats,
@@ -311,6 +393,18 @@ pub fn render(
         &plos.mask,
         &mut out[..n_special],
         report,
+    );
+    progress.finish(
+        Phase::Sibilants,
+        format!(
+            "{} of {} sibilants resynthesized",
+            report
+                .sibilant_overlays
+                .iter()
+                .filter(|o| o.applied)
+                .count(),
+            report.sibilant_overlays.len()
+        ),
     );
 
     // Mid/side: duck the side where the mid is specially rendered, then recombine.
@@ -387,5 +481,9 @@ pub fn render(
             },
         }
     });
-    Ok((out, layers))
+    Ok(Rendered {
+        channels: out,
+        layers,
+        f0_ref_hz,
+    })
 }

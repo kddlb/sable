@@ -127,6 +127,7 @@ pub fn render(
     map: &TimeMap,
     anchors: &[Anchor],
     cfg: &WsolaConfig,
+    progress: &mut dyn FnMut(usize, usize),
 ) -> WsolaOutput {
     let n_out = map.n_out as usize;
     let n_in = mono.len();
@@ -148,7 +149,10 @@ pub fn render(
     let mut covered_to: i64 = i64::MIN;
     let mut abs_off_sum = 0f64;
     let mut tmpl = Vec::new();
-    for g in &grains {
+    for (gi, g) in grains.iter().enumerate() {
+        if gi % 64 == 0 {
+            progress(gi, grains.len());
+        }
         let half = (g.n / 2) as i64;
         let pred = map.inverse(g.y as f64).round() as i64;
         let start_out = g.y - half;
@@ -315,7 +319,7 @@ mod tests {
         let x: Vec<f32> = (0..3000).map(|i| (i as f32 * 0.07).sin() * 0.5).collect();
         for n_out in [1u64, 2, 17, 1500, 2999, 3000, 6001, 12000] {
             let map = TimeMap::uniform(3000, n_out);
-            let out = render(&[&x], &x, &map, &[], &cfg);
+            let out = render(&[&x], &x, &map, &[], &cfg, &mut |_, _| {});
             assert_eq!(out.channels[0].len(), n_out as usize);
             assert_eq!(out.stats.uncovered_filled, 0);
             assert!(out.channels[0].iter().all(|v| v.is_finite()));
@@ -326,7 +330,14 @@ mod tests {
     fn silence_stays_zero() {
         let cfg = WsolaConfig::new(8_000, QualityPreset::Standard);
         let z = vec![0f32; 1000];
-        let out = render(&[&z, &z], &z, &TimeMap::uniform(1000, 1777), &[], &cfg);
+        let out = render(
+            &[&z, &z],
+            &z,
+            &TimeMap::uniform(1000, 1777),
+            &[],
+            &cfg,
+            &mut |_, _| {},
+        );
         assert!(out.channels.iter().flatten().all(|&v| v == 0.0));
     }
 }

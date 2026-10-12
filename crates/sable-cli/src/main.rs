@@ -9,7 +9,10 @@ use clap::{Parser, ValueEnum};
 use sable_cli::trim::SilenceTrim;
 use sable_cli::wav::{Format, write_wav};
 use sable_cli::{load_input, may_have_encoder_padding, supported_extensions};
-use sable_core::{AudioView, Options, QualityPreset, StereoMode, StretchRatio, stretch};
+use sable_core::{
+    AudioView, FormantMode, Options, ProgressEvent, QualityPreset, StereoMode, StretchRatio,
+    stretch_with_progress,
+};
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum Stereo {
@@ -20,13 +23,21 @@ enum Stereo {
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
+enum Formants {
+    /// Keep the spectral envelope: same voice, new pitch.
+    Preserve,
+    /// Move formants with the pitch (tape-speed character).
+    Shift,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
 enum Quality {
     Fast,
     Standard,
     High,
 }
 
-/// Pitch-preserving speech time stretcher with sample-exact output length.
+/// Speech time stretcher and pitch shifter with sample-exact output length.
 #[derive(Parser, Debug)]
 #[command(name = "sable", version)]
 struct Cli {
@@ -38,8 +49,19 @@ struct Cli {
     #[arg(long, short)]
     output: PathBuf,
     /// Stretch factor = duration_out / duration_in, as "p/q" or a decimal ("1.25").
+    /// Use 1 to only shift the pitch.
     #[arg(long, short)]
     stretch: String,
+    /// Pitch shift in semitones (-24..=24, fractional allowed). Duration is still set by
+    /// --stretch alone.
+    #[arg(long, default_value_t = 0.0, allow_negative_numbers = true)]
+    pitch: f64,
+    /// Formant handling for --pitch.
+    #[arg(long, value_enum, default_value_t = Formants::Preserve)]
+    formants: Formants,
+    /// Print each processing phase with its timing to stderr as it finishes.
+    #[arg(long)]
+    progress: bool,
     /// Seed for deterministic noise resynthesis.
     #[arg(long, default_value_t = Options::default().seed)]
     seed: u64,
@@ -133,13 +155,29 @@ fn run(cli: Cli) -> Result<(), String> {
         Stereo::Ms => StereoMode::MidSide,
     };
     opts.side_duck_db = cli.side_duck_db.min(0.0);
+    opts.pitch_semitones = cli.pitch;
+    opts.formants = match cli.formants {
+        Formants::Preserve => FormantMode::Preserve,
+        Formants::Shift => FormantMode::Shift,
+    };
 
     let refs = input.view_refs();
     let view = AudioView {
         sample_rate: input.sample_rate,
         channels: &refs,
     };
-    let result = stretch(&view, ratio, &opts).map_err(|e| e.to_string())?;
+    let mut phase_start = std::time::Instant::now();
+    let mut on_progress = |e: ProgressEvent| match e {
+        ProgressEvent::Started(_) => phase_start = std::time::Instant::now(),
+        ProgressEvent::Finished { phase, detail } if cli.progress => eprintln!(
+            "{:<22}{:>8.0} ms  {detail}",
+            phase.label(),
+            phase_start.elapsed().as_secs_f64() * 1000.0
+        ),
+        _ => {}
+    };
+    let result =
+        stretch_with_progress(&view, ratio, &opts, &mut on_progress).map_err(|e| e.to_string())?;
     let r = &result.report;
     let actual = result.audio.frames() as u64;
     println!("ratio          {} ({:.6})", r.ratio, r.ratio_f64);
@@ -151,6 +189,12 @@ fn run(cli: Cli) -> Result<(), String> {
         println!(
             "skipped        {skipped} leading frames ({:.1} ms of silence)",
             skipped as f64 * 1000.0 / r.sample_rate as f64
+        );
+    }
+    if let Some(p) = &r.pitch {
+        println!(
+            "pitch          {:+} semitones (×{:.4}), formants {:?}, internal stretch {} frames",
+            p.semitones, p.factor, p.formants, p.internal_frames
         );
     }
     if let Some(d) = r.side_duck_db {

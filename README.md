@@ -58,6 +58,9 @@ target/release/sable -i speech.wav -o faster.wav -s 0.75 --seed 42 \
 | `--stereo-mode lr\|ms` | stereo strategy. `lr` (default) renders every event on both channels, with a stereo noise covariance model for sibilants. `ms` gives the mid the full SABLE treatment and the side WSOLA on the same time map and grain positions, ducked by `--side-duck-db` (default −6) inside the mid's resynthesized sibilants and burst cores. See [COMPROMISES §8](docs/COMPROMISES.md) before using `ms` on panned or spaced-microphone material. |
 | `--skip-leading-silence` | drop silence before the first sound, keeping a 20 ms pre-roll (`--silence-threshold-db`, default −50 dBFS RMS on the loudest channel; `--silence-preroll-ms`). The exact output length then applies to the **trimmed** input, and the skipped frame count is printed and stored under `input` in the diagnostics JSON. |
 | `--generic` | uniform generic WSOLA with all speech handling off (comparison baseline) |
+| `--pitch ST` | shift the pitch by `ST` semitones (−24…24, fractional allowed) without changing the duration set by `--stretch`. Use `--stretch 1` for a pure pitch shift. See [ALGORITHM §10a](docs/ALGORITHM.md). |
+| `--formants preserve\|shift` | with `--pitch`: keep the spectral envelope (default, same voice) or move it with the pitch (tape-speed character) |
+| `--progress` | print each processing phase with its time and a short summary to stderr |
 
 ### Input formats
 

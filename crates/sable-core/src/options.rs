@@ -14,6 +14,16 @@ pub enum StereoMode {
     MidSide,
 }
 
+/// What happens to the spectral envelope when the pitch is shifted.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub enum FormantMode {
+    /// Keep formants (and sibilant colour) where they were: same voice, new pitch.
+    #[default]
+    Preserve,
+    /// Move formants with the pitch, like a tape-speed change ("chipmunk" upwards).
+    Shift,
+}
+
 /// Trades CPU time for search breadth and analysis resolution.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 pub enum QualityPreset {
@@ -45,6 +55,11 @@ pub struct Options {
     /// Side-channel gain (dB, <= 0) inside resynthesized sibilants and protected burst
     /// cores in [`StereoMode::MidSide`]; follows the renderer masks smoothly.
     pub side_duck_db: f64,
+    /// Pitch shift in semitones (`0` = none, the pure time stretch). Range ±24.
+    /// Duration is still set by the stretch ratio alone.
+    pub pitch_semitones: f64,
+    /// Envelope handling for a nonzero `pitch_semitones`.
+    pub formants: FormantMode,
 }
 
 impl Default for Options {
@@ -60,11 +75,21 @@ impl Default for Options {
             uniform_timing: false,
             stereo_mode: StereoMode::LeftRight,
             side_duck_db: -6.0,
+            pitch_semitones: 0.0,
+            formants: FormantMode::Preserve,
         }
     }
 }
 
+/// Largest accepted `|pitch_semitones|` (two octaves).
+pub const MAX_PITCH_SEMITONES: f64 = 24.0;
+
 impl Options {
+    /// Pitch factor `2^(semitones / 12)`, or `None` when no shift is requested.
+    pub fn pitch_factor(&self) -> Option<f64> {
+        (self.pitch_semitones != 0.0).then(|| (self.pitch_semitones / 12.0).exp2())
+    }
+
     /// Generic WSOLA with every speech-specific policy disabled (comparison baseline).
     pub fn generic_wsola() -> Self {
         Self {

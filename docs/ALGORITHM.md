@@ -358,6 +358,34 @@ fade, the WSOLA material is crossfaded to the new noise with *equal-power* weigh
   equals left/right exactly. Measurements show it loses the position of off-centre voices
   during resynthesized sibilants; see [COMPROMISES §8](COMPROMISES.md).
 
+### 10a. Pitch shifting (`lib.rs`, `formant.rs`, `resample.rs`)
+
+A pitch shift of `st` semitones (factor `s = 2^(st/12)`, ±24 st) reuses everything above:
+
+1. **Stretch.** The full pipeline stretches to `M = round(N_out · s)` frames, using the
+   exact ratio `M / N_in`. Pitch is unchanged; bursts and sibilants get their usual
+   handling.
+2. **Formants (optional).** In `Preserve` mode each 40 ms STFT frame (hop 1/4, 2× zero
+   padding) is filtered by `G(f) = H(s·f) / H(f)`. `H` is the true envelope (iterated
+   cepstral smoothing) of the channel mean, with a lifter at half the period of the
+   input's 85th-percentile F0. The same gain goes to every channel, and it is clamped
+   to ±30 dB.
+3. **Resample.** A Kaiser-windowed sinc (16 zero crossings, β = 9) maps the `M` frames
+   onto exactly `N_out`, low-passing at the output Nyquist when `s > 1`. Every
+   frequency is multiplied by `s`, and the envelope pre-warp of step 2 lands back at
+   `H(f)`.
+
+The length contract is unchanged. Segment and overlay positions in the report are
+rescaled to final output frames, and `report.pitch` records `M` and the envelope
+settings. Two consequences:
+
+* Bursts are copied 1:1 in the intermediate signal, so in the output they are resampled
+  by `1/s` like everything else.
+* For `s < 1`, the band above `s · fs/2` is empty, because there is nothing to move
+  down into it.
+
+`ExtremeInternalStretch` warns when `r · s` leaves `[1/2, 2]`.
+
 ---
 
 ## 11. Around the core

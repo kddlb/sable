@@ -28,6 +28,8 @@ pub enum StretchError {
     OutputTooShort { n_in: u64 },
     #[error("target output of {n_out} frames exceeds configured limit of {limit}")]
     OutputTooLarge { n_out: u128, limit: u64 },
+    #[error("pitch shift of {0} semitones is outside -24..=24 or not finite")]
+    InvalidPitch(String),
     #[error("arithmetic overflow while computing the target frame count")]
     Overflow,
     #[error("internal invariant violated: {0}")]

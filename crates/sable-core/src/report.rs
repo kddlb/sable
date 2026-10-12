@@ -3,7 +3,8 @@
 use serde::Serialize;
 
 use crate::budget::Stage;
-use crate::options::StereoMode;
+use crate::formant::FormantStats;
+use crate::options::{FormantMode, StereoMode};
 use crate::ratio::StretchRatio;
 use crate::segments::{EventKind, SegmentScores};
 
@@ -24,6 +25,9 @@ pub enum RenderPath {
 pub enum Warning {
     /// Factor outside the v0.1 quality target `[1/2, 2]`.
     ExtremeStretchFactor { ratio: f64 },
+    /// Pitch shifting stretches internally by `ratio × pitch factor`, and that internal
+    /// factor is outside `[1/2, 2]`.
+    ExtremeInternalStretch { internal_ratio: f64 },
     /// Stage B: non-burst bounds were widened beyond the class table.
     RelaxedNonBurstBudget,
     /// Stage C: these burst segments did not keep their 1x duration.
@@ -104,6 +108,22 @@ pub struct FeatureDump {
     pub zcr: Vec<f32>,
 }
 
+/// How a pitch shift was rendered: SABLE stretch to `internal_frames`, optional
+/// envelope pre-warp, then band-limited resampling to `n_out`.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct PitchReport {
+    pub semitones: f64,
+    /// Frequency factor `2^(semitones / 12)`.
+    pub factor: f64,
+    pub formants: FormantMode,
+    /// Length of the intermediate stretch (`round(n_out × factor)`).
+    pub internal_frames: u64,
+    /// Exact intermediate stretch ratio `internal_frames / n_in`.
+    pub internal_ratio: StretchRatio,
+    /// Envelope correction details (formant-preserving mode only).
+    pub formant: Option<FormantStats>,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct AnalysisReport {
     pub version: &'static str,
@@ -129,6 +149,9 @@ pub struct AnalysisReport {
     pub wsola: Option<WsolaStats>,
     pub levels: Vec<ChannelLevels>,
     pub features: Option<FeatureDump>,
+    /// Present when a pitch shift was requested. Segment and overlay output positions
+    /// are always given in final output frames.
+    pub pitch: Option<PitchReport>,
 }
 
 impl AnalysisReport {
@@ -162,6 +185,7 @@ impl AnalysisReport {
             wsola: None,
             levels: Vec::new(),
             features: None,
+            pitch: None,
         }
     }
 }

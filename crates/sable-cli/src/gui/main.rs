@@ -1,8 +1,9 @@
 //! `sable-gui`: desktop front end for SABLE (build with `--features gui`).
 //!
-//! Open a WAV, inspect the detected acoustic events, stretch it with any exact ratio,
-//! compare original and result (waveforms, event bands, renderer masks, playback),
-//! and save audio, diagnostics and intermediate layers.
+//! Open a WAV, inspect the detected acoustic events, stretch it with any exact ratio and
+//! optionally shift its pitch (with or without formants), follow the render phase by
+//! phase, compare original and result (waveforms, event bands, renderer masks,
+//! playback), and save audio, diagnostics and intermediate layers.
 
 #![forbid(unsafe_code)]
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
@@ -20,22 +21,23 @@ use eframe::egui::{self, Color32, RichText};
 use sable_cli::trim::{SilenceTrim, leading_silence_frames, skip_frames};
 use sable_cli::wav::{Format, write_wav};
 use sable_cli::{may_have_encoder_padding, read_audio, supported_extensions};
-use sable_core::StereoMode;
 use sable_core::detect::BurstCandidate;
 use sable_core::segments::{EventKind, Segment};
 use sable_core::{
     AudioBuffer, AudioView, Options, ProcessResult, QualityPreset, StretchRatio, analyze_events,
-    stretch,
+    stretch_with_progress,
 };
+use sable_core::{FormantMode, MAX_PITCH_SEMITONES, Phase, ProgressEvent, StereoMode};
 
 use emoji::{emoji_button, emoji_label};
 use player::{Player, Source};
 use wave::{Band, Lane, kind_color};
 
 fn main() -> eframe::Result {
-    // Usage: sable-gui [file.wav [ratio]]  (a ratio processes immediately)
+    // Usage: sable-gui [file.wav [ratio [semitones]]]  (a ratio processes immediately)
     let initial = std::env::args_os().nth(1).map(PathBuf::from);
     let auto_ratio = std::env::args().nth(2);
+    let auto_pitch = std::env::args().nth(3).and_then(|s| s.parse::<f64>().ok());
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("SABLE")
@@ -47,7 +49,7 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "SABLE",
         options,
-        Box::new(move |cc| Ok(Box::new(App::new(cc, initial, auto_ratio)))),
+        Box::new(move |cc| Ok(Box::new(App::new(cc, initial, auto_ratio, auto_pitch)))),
     )
 }
 
@@ -76,6 +78,8 @@ struct Settings {
     silence_db: f64,
     mid_side: bool,
     side_duck_db: f64,
+    pitch_semitones: f64,
+    formants: FormantMode,
 }
 
 impl Settings {
@@ -94,13 +98,98 @@ impl Settings {
             o.stereo_mode = StereoMode::MidSide;
         }
         o.side_duck_db = self.side_duck_db.min(0.0);
+        o.pitch_semitones = self.pitch_semitones;
+        o.formants = self.formants;
         o
+    }
+}
+
+/// One line of the live process readout.
+#[derive(Clone)]
+struct PhaseRow {
+    phase: Phase,
+    started: Instant,
+    /// Set when the phase finished.
+    took: Option<Duration>,
+    fraction: f32,
+    detail: String,
+}
+
+/// Phase-by-phase log of one processing run, fed by [`ProgressEvent`]s.
+#[derive(Clone, Default)]
+struct ProcessLog {
+    rows: Vec<PhaseRow>,
+}
+
+impl ProcessLog {
+    fn apply(&mut self, at: Instant, e: ProgressEvent) {
+        match e {
+            ProgressEvent::Started(phase) => self.rows.push(PhaseRow {
+                phase,
+                started: at,
+                took: None,
+                fraction: 0.0,
+                detail: String::new(),
+            }),
+            ProgressEvent::Progress { phase, fraction } => {
+                if let Some(r) = self.rows.iter_mut().rev().find(|r| r.phase == phase) {
+                    r.fraction = fraction;
+                }
+            }
+            ProgressEvent::Finished { phase, detail } => {
+                if let Some(r) = self.rows.iter_mut().rev().find(|r| r.phase == phase) {
+                    r.took = Some(at.duration_since(r.started));
+                    r.fraction = 1.0;
+                    r.detail = detail;
+                }
+            }
+        }
+    }
+
+    /// One row per phase: state, name, progress bar (running) or duration, and summary.
+    fn show(&self, ui: &mut egui::Ui) {
+        ui.spacing_mut().item_spacing.y = 2.0;
+        for r in &self.rows {
+            ui.horizontal(|ui| {
+                match r.took {
+                    Some(_) => emoji_label(ui, "✅"),
+                    None => ui.add(egui::Spinner::new().size(14.0)),
+                };
+                ui.label(r.phase.label());
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    match r.took {
+                        Some(t) => ui.label(
+                            RichText::new(format!("{:.0} ms", t.as_secs_f64() * 1000.0))
+                                .monospace(),
+                        ),
+                        None => ui.add(
+                            egui::ProgressBar::new(r.fraction)
+                                .desired_width(120.0)
+                                .text(format!(
+                                    "{:.0}% · {:.1} s",
+                                    r.fraction * 100.0,
+                                    r.started.elapsed().as_secs_f64()
+                                )),
+                        ),
+                    };
+                });
+            });
+            if !r.detail.is_empty() {
+                ui.horizontal(|ui| {
+                    ui.add_space(24.0);
+                    ui.add(egui::Label::new(RichText::new(&r.detail).weak().small()).wrap());
+                });
+            }
+            ui.add_space(2.0);
+        }
     }
 }
 
 /// A running processing job.
 struct Job {
     rx: Receiver<Result<Done, String>>,
+    progress_rx: Receiver<(Instant, ProgressEvent)>,
+    log: ProcessLog,
     started: Instant,
     settings: Settings,
 }
@@ -116,6 +205,8 @@ struct Done {
     elapsed: Duration,
     /// Leading input frames dropped before stretching (skip-silence option).
     skipped: usize,
+    /// Phase timings of the run that produced this result.
+    log: ProcessLog,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -157,6 +248,7 @@ impl App {
         cc: &eframe::CreationContext<'_>,
         initial: Option<PathBuf>,
         auto_ratio: Option<String>,
+        auto_pitch: Option<f64>,
     ) -> Self {
         egui_extras::install_image_loaders(&cc.egui_ctx);
         let mut app = Self {
@@ -172,6 +264,8 @@ impl App {
                 silence_db: SilenceTrim::default().threshold_db,
                 mid_side: false,
                 side_duck_db: Options::default().side_duck_db,
+                pitch_semitones: 0.0,
+                formants: FormantMode::Preserve,
             },
             format: Format::Float32,
             analyze_rx: None,
@@ -197,6 +291,8 @@ impl App {
                 silence_db: 0.0,
                 mid_side: false,
                 side_duck_db: 0.0,
+                pitch_semitones: 0.0,
+                formants: FormantMode::Preserve,
             },
             changed_at: None,
             failed_settings: None,
@@ -204,6 +300,9 @@ impl App {
         app.last_settings = app.settings.clone();
         if let Some(p) = initial {
             app.open(&p, &cc.egui_ctx);
+            if let Some(st) = auto_pitch {
+                app.settings.pitch_semitones = st.clamp(-MAX_PITCH_SEMITONES, MAX_PITCH_SEMITONES);
+            }
             if let Some(r) = auto_ratio {
                 app.settings.ratio_text = r;
                 app.process(&cc.egui_ctx);
@@ -263,6 +362,7 @@ impl App {
         let full = input.audio.clone();
         let settings = self.settings.clone();
         let (tx, rx) = channel();
+        let (ptx, prx) = channel();
         let ctx2 = ctx.clone();
         std::thread::spawn(move || {
             let t = Instant::now();
@@ -285,13 +385,19 @@ impl App {
                 sample_rate: audio.sample_rate,
                 channels: &refs,
             };
-            let r = stretch(&view, ratio, &settings.options())
+            let ctx3 = ctx2.clone();
+            let mut on_progress = move |e: ProgressEvent| {
+                let _ = ptx.send((Instant::now(), e));
+                ctx3.request_repaint();
+            };
+            let r = stretch_with_progress(&view, ratio, &settings.options(), &mut on_progress)
                 .map(|result| Done {
                     audio: Arc::new(result.audio.clone()),
                     result: Arc::new(result),
                     settings,
                     elapsed: t.elapsed(),
                     skipped,
+                    log: ProcessLog::default(),
                 })
                 .map_err(|e| e.to_string());
             let _ = tx.send(r);
@@ -299,6 +405,8 @@ impl App {
         });
         self.process_rx = Some(Job {
             rx,
+            progress_rx: prx,
+            log: ProcessLog::default(),
             started: Instant::now(),
             settings: self.settings.clone(),
         });
@@ -319,13 +427,24 @@ impl App {
                 _ => {}
             }
         }
+        if let Some(job) = &mut self.process_rx {
+            while let Ok((at, e)) = job.progress_rx.try_recv() {
+                job.log.apply(at, e);
+            }
+        }
         if let Some(job) = &self.process_rx
             && let Ok(r) = job.rx.try_recv()
         {
             let job_settings = job.settings.clone();
+            let mut log = job.log.clone();
+            // Events sent just before the result may still be queued.
+            while let Ok((at, e)) = job.progress_rx.try_recv() {
+                log.apply(at, e);
+            }
             self.process_rx = None;
             match r {
-                Ok(done) => {
+                Ok(mut done) => {
+                    done.log = log;
                     // Keep playing the result across reprocessing: same source position.
                     let resume = match self.playing() {
                         Some((Source::Result, pos, _)) => Some(self.out_to_in(pos)),
@@ -590,6 +709,72 @@ impl App {
 
             ui.add_space(8.0);
             ui.horizontal(|ui| {
+                emoji_label(ui, "🎵");
+                ui.heading("Pitch");
+            });
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::DragValue::new(&mut self.settings.pitch_semitones)
+                        .range(-MAX_PITCH_SEMITONES..=MAX_PITCH_SEMITONES)
+                        .speed(0.05)
+                        .fixed_decimals(2)
+                        .suffix(" st"),
+                )
+                .on_hover_text(
+                    "Semitones (drag or type). Duration is still set by the stretch factor.",
+                );
+                ui.label(
+                    RichText::new(format!(
+                        "×{:.4} in frequency",
+                        (self.settings.pitch_semitones / 12.0).exp2()
+                    ))
+                    .weak(),
+                );
+            });
+            ui.horizontal_wrapped(|ui| {
+                for st in [-12.0, -7.0, -5.0, -2.0, 0.0, 2.0, 5.0, 7.0, 12.0] {
+                    let label = if st == 0.0 {
+                        "0".to_string()
+                    } else {
+                        format!("{st:+}")
+                    };
+                    if ui
+                        .selectable_label(self.settings.pitch_semitones == st, label)
+                        .clicked()
+                    {
+                        self.settings.pitch_semitones = st;
+                    }
+                }
+            });
+            ui.add_enabled_ui(self.settings.pitch_semitones != 0.0, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Formants");
+                    egui::ComboBox::from_id_salt("formants")
+                        .selected_text(match self.settings.formants {
+                            FormantMode::Preserve => "Preserve",
+                            FormantMode::Shift => "Shift with pitch",
+                        })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut self.settings.formants,
+                                FormantMode::Preserve,
+                                "Preserve",
+                            )
+                            .on_hover_text("Keep the spectral envelope: same voice, new pitch.");
+                            ui.selectable_value(
+                                &mut self.settings.formants,
+                                FormantMode::Shift,
+                                "Shift with pitch",
+                            )
+                            .on_hover_text(
+                                "Formants move with the pitch, like changing tape speed.",
+                            );
+                        });
+                });
+            });
+
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
                 emoji_label(ui, "🎛️");
                 ui.heading("Options");
             });
@@ -681,6 +866,23 @@ impl App {
                     ui.label(format!("{:.1} s", job.started.elapsed().as_secs_f64()));
                 }
             });
+            // Live readout of the running job, else the timings of the shown result.
+            let log = match (&self.process_rx, &self.done) {
+                (Some(job), _) => Some((&job.log, None)),
+                (None, Some(d)) => Some((&d.log, Some(d.elapsed))),
+                _ => None,
+            };
+            if let Some((log, total)) = log
+                && !log.rows.is_empty()
+            {
+                egui::CollapsingHeader::new(match total {
+                    None => "Process (running)".to_string(),
+                    Some(t) => format!("Process ({:.0} ms total)", t.as_secs_f64() * 1000.0),
+                })
+                .id_salt("process_readout")
+                .default_open(true)
+                .show(ui, |ui| log.show(ui));
+            }
             if let Some(d) = &self.done
                 && d.settings != self.settings
             {
@@ -833,7 +1035,23 @@ impl App {
             .as_ref()
             .map(|d| d.result.report.ratio.to_string().replace('/', "-"))
             .unwrap_or_default();
-        format!("{stem}_x{r}{suffix}.{ext}")
+        let pitch = self
+            .done
+            .as_ref()
+            .and_then(|d| d.result.report.pitch.as_ref())
+            .map(|p| {
+                format!(
+                    "_{:+}st{}",
+                    p.semitones,
+                    if p.formants == FormantMode::Shift {
+                        "_formants-shifted"
+                    } else {
+                        ""
+                    }
+                )
+            })
+            .unwrap_or_default();
+        format!("{stem}_x{r}{pitch}{suffix}.{ext}")
     }
 
     fn save_result(&mut self) {
@@ -959,7 +1177,7 @@ impl App {
                     l.sibilant_mask.channels[0].as_slice(),
                 )
             });
-            let title = format!(
+            let mut title = format!(
                 "Result ({})",
                 if d.settings.generic {
                     "generic WSOLA"
@@ -967,6 +1185,16 @@ impl App {
                     "SABLE"
                 }
             );
+            if let Some(p) = &d.result.report.pitch {
+                title += &format!(
+                    ", pitch {:+.2} st, formants {}",
+                    p.semitones,
+                    match p.formants {
+                        FormantMode::Preserve => "preserved",
+                        FormantMode::Shift => "shifted",
+                    }
+                );
+            }
             let out_resp = Lane {
                 title: &title,
                 channels: &res.audio.channels,
@@ -1195,6 +1423,33 @@ impl App {
                             ui.label("uncovered filled");
                             ui.label(w.uncovered_filled.to_string());
                             ui.end_row();
+                        }
+                        if let Some(p) = &r.pitch {
+                            ui.label("pitch");
+                            ui.label(format!(
+                                "{:+.2} st (×{:.4}), formants {:?}",
+                                p.semitones, p.factor, p.formants
+                            ));
+                            ui.label("internal stretch");
+                            ui.label(format!(
+                                "{} frames ({:.4}×)",
+                                p.internal_frames,
+                                p.internal_ratio.as_f64()
+                            ));
+                            ui.end_row();
+                            if let Some(f) = &p.formant {
+                                ui.label("envelope lifter");
+                                ui.label(format!(
+                                    "{:.2} ms (F0 ref {:.0} Hz)",
+                                    f.lifter_ms, f.f0_ref_hz
+                                ));
+                                ui.label("envelope frames");
+                                ui.label(format!(
+                                    "{} ({:.1} iterations)",
+                                    f.frames, f.mean_iterations
+                                ));
+                                ui.end_row();
+                            }
                         }
                         ui.label("skipped silence");
                         ui.label(if d.skipped > 0 {
