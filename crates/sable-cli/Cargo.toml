@@ -1,0 +1,17 @@
+[package]
+name = "sable-cli"
+description = "Command-line WAV front end for SABLE"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "sable"
+path = "src/main.rs"
+
+[dependencies]
+sable-core = { path = "../sable-core" }
+hound.workspace = true
+clap.workspace = true
+serde_json.workspace = true

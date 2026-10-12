@@ -1,0 +1,23 @@
+[package]
+name = "sable-core"
+description = "SABLE: Speech-Adaptive Budgeted Lengthening Engine (pitch-preserving speech time-scale modification)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+realfft.workspace = true
+rand_chacha.workspace = true
+rand_core.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+serde_json.workspace = true
+hound.workspace = true
+
+[[bench]]
+name = "speech"
+harness = false

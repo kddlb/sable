@@ -1,0 +1,5 @@
+/target
+/ab/
+/out/
+*.wav
+!/fixtures/**/*.wav
