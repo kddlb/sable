@@ -470,6 +470,29 @@ fn ms_power(x: &[f32], a: usize, b: usize) -> f64 {
         / (b - a) as f64
 }
 
+/// Outcome of the in-order eligibility pass for one sibilant segment.
+enum Step {
+    Skip { seg: usize, reason: String },
+    Render(Job),
+}
+
+/// An eligible segment: index, output guard and fade, and source interior power.
+struct Job {
+    seg: usize,
+    guard: usize,
+    fade: usize,
+    src_ms: Vec<f64>,
+}
+
+/// Calibrated noise for one job, plus what the report needs.
+struct Rendered {
+    noise: Vec<Vec<f32>>,
+    gains: Vec<f64>,
+    n_fft: usize,
+    coherence_instability: f64,
+    interchannel_lag: f64,
+}
+
 pub fn apply(
     input: &AudioView<'_>,
     features: &Features,
@@ -490,6 +513,10 @@ pub fn apply(
     let split = BandSplit::new(fs);
     let silence_ms = 10f64.powf(features.silence_thr_db as f64 / 10.0);
 
+    // Pass 1 (in order): eligibility checks. Pass 2 (parallel): spectral template and
+    // noise per eligible segment, each with its own seeded stream. Pass 3 (in order):
+    // report and mix. The result does not depend on the thread count.
+    let mut steps: Vec<Step> = Vec::new();
     for (i, seg) in plan.segments.iter().enumerate() {
         if !seg.kind.is_sibilant() {
             continue;
@@ -497,21 +524,14 @@ pub fn apply(
         let o0 = plan.out_start(i) as usize;
         let o1 = plan.out_start(i + 1) as usize;
         let d = o1 - o0;
-        let skip = |reason: String, report: &mut AnalysisReport| {
-            report.sibilant_overlays.push(OverlayReport {
-                segment_id: seg.id,
-                applied: false,
-                out_start: o0 as u64,
-                out_end: o1 as u64,
-                detail: reason.clone(),
-            });
-            report.warnings.push(Warning::SpecialRendererDisabled {
-                segment_id: seg.id,
-                reason,
-            });
+        let skip = |reason: String, steps: &mut Vec<Step>| {
+            steps.push(Step::Skip { seg: i, reason });
         };
         if !opts.enable_sibilant {
-            skip("sibilant resynthesis disabled by options".into(), report);
+            skip(
+                "sibilant resynthesis disabled by options".into(),
+                &mut steps,
+            );
             continue;
         }
         if seg.confidence < cfg.min_confidence {
@@ -520,7 +540,7 @@ pub fn apply(
                     "confidence {:.2} below {:.2}",
                     seg.confidence, cfg.min_confidence
                 ),
-                report,
+                &mut steps,
             );
             continue;
         }
@@ -532,7 +552,7 @@ pub fn apply(
                     cfg.guard_ms,
                     cfg.min_interior_ms
                 ),
-                report,
+                &mut steps,
             );
             continue;
         }
@@ -542,7 +562,7 @@ pub fn apply(
         if fade == 0 {
             skip(
                 format!("allocated output of {d} frames leaves no room for fades"),
-                report,
+                &mut steps,
             );
             continue;
         }
@@ -552,7 +572,7 @@ pub fn apply(
         {
             skip(
                 "overlaps a protected plosive burst (plosive wins)".into(),
-                report,
+                &mut steps,
             );
             continue;
         }
@@ -572,19 +592,47 @@ pub fn apply(
             s1 - guard_in as usize,
         );
         if mono_ms <= silence_ms {
-            skip("event energy below the silence threshold".into(), report);
-            continue;
-        }
-        let template = SpectralTemplate::analyze(input.channels, s0, s1, fs, &cfg);
-        if nch == 2 && template.coherence_instability > cfg.max_coherence_instability {
             skip(
-                format!(
-                    "stereo coherence unstable ({:.2} > {:.2}); keeping WSOLA",
-                    template.coherence_instability, cfg.max_coherence_instability
-                ),
-                report,
+                "event energy below the silence threshold".into(),
+                &mut steps,
             );
             continue;
+        }
+        steps.push(Step::Render(Job {
+            seg: i,
+            guard,
+            fade,
+            src_ms,
+        }));
+    }
+
+    let jobs: Vec<&Job> = steps
+        .iter()
+        .filter_map(|st| match st {
+            Step::Render(j) => Some(j),
+            Step::Skip { .. } => None,
+        })
+        .collect();
+    let threads = crate::par::threads(opts.threads);
+    let mut rendered = crate::par::map(jobs.len(), threads, |k| {
+        let job = jobs[k];
+        let seg = &plan.segments[job.seg];
+        let (o0, d) = (
+            plan.out_start(job.seg) as usize,
+            (plan.out_start(job.seg + 1) - plan.out_start(job.seg)) as usize,
+        );
+        let template = SpectralTemplate::analyze(
+            input.channels,
+            seg.start as usize,
+            seg.end as usize,
+            fs,
+            &cfg,
+        );
+        if nch == 2 && template.coherence_instability > cfg.max_coherence_instability {
+            return Err(format!(
+                "stereo coherence unstable ({:.2} > {:.2}); keeping WSOLA",
+                template.coherence_instability, cfg.max_coherence_instability
+            ));
         }
         let mut synth = NoiseSynth::new(template.n_fft);
         let mut stream = GaussianStream::new(opts.seed, seg.id as u64);
@@ -603,16 +651,56 @@ pub fn apply(
         // Event-level bounded calibration against the source interior energy.
         let bound = 10f64.powf(cfg.calib_bound_db / 20.0);
         let mut gains = Vec::with_capacity(nch);
-        for ch in 0..nch {
-            let syn = ms_power(&noise[ch], guard, d - guard);
+        for (x, &src_ms) in noise.iter_mut().zip(&job.src_ms) {
+            let syn = ms_power(x, job.guard, d - job.guard);
             let g = if syn > 0.0 {
-                (src_ms[ch] / syn).sqrt().clamp(1.0 / bound, bound)
+                (src_ms / syn).sqrt().clamp(1.0 / bound, bound)
             } else {
                 1.0
             };
             gains.push(g);
-            noise[ch].iter_mut().for_each(|v| *v *= g as f32);
+            x.iter_mut().for_each(|v| *v *= g as f32);
         }
+        Ok(Rendered {
+            noise,
+            gains,
+            n_fft: template.n_fft,
+            coherence_instability: template.coherence_instability,
+            interchannel_lag: template.interchannel_lag,
+        })
+    })
+    .into_iter();
+
+    for step in steps {
+        let (i, outcome) = match step {
+            Step::Skip { seg, reason } => (seg, Err(reason)),
+            Step::Render(job) => {
+                let r = rendered.next().expect("one result per job");
+                (job.seg, r.map(|r| (job, r)))
+            }
+        };
+        let seg = &plan.segments[i];
+        let o0 = plan.out_start(i) as usize;
+        let o1 = plan.out_start(i + 1) as usize;
+        let d = o1 - o0;
+        let (job, r) = match outcome {
+            Ok(x) => x,
+            Err(reason) => {
+                report.sibilant_overlays.push(OverlayReport {
+                    segment_id: seg.id,
+                    applied: false,
+                    out_start: o0 as u64,
+                    out_end: o1 as u64,
+                    detail: reason.clone(),
+                });
+                report.warnings.push(Warning::SpecialRendererDisabled {
+                    segment_id: seg.id,
+                    reason,
+                });
+                continue;
+            }
+        };
+        let (guard, fade, gains, noise) = (job.guard, job.fade, r.gains, r.noise);
         // Equal-power fade weights.
         let theta: Vec<f64> = (0..d)
             .map(|t| {
@@ -668,7 +756,7 @@ pub fn apply(
                 d,
                 guard,
                 fade,
-                template.n_fft,
+                r.n_fft,
                 gains
                     .iter()
                     .map(|g| format!("{:+.2}", 20.0 * g.log10()))
@@ -677,7 +765,7 @@ pub fn apply(
                 if nch == 2 {
                     format!(
                         ", coherence instability {:.2}, inter-channel lag {:.1} samples",
-                        template.coherence_instability, template.interchannel_lag
+                        r.coherence_instability, r.interchannel_lag
                     )
                 } else {
                     String::new()

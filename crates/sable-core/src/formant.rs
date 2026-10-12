@@ -66,12 +66,44 @@ fn cepstral_smooth(
     }
 }
 
+/// Per-worker FFT and spectrum buffers for [`prewarp`].
+struct FrameScratch {
+    fft: RealFft,
+    frame: Vec<f32>,
+    chan_spec: Vec<Vec<Complex>>,
+    log_mag: Vec<f64>,
+    a: Vec<f64>,
+    env: Vec<f64>,
+    scratch: Vec<Complex>,
+    mono_mag: Vec<f64>,
+}
+
+impl FrameScratch {
+    fn new(k: usize, nch: usize) -> Self {
+        let bins = k / 2 + 1;
+        Self {
+            fft: RealFft::new(k),
+            frame: vec![0f32; k],
+            chan_spec: vec![vec![Complex::new(0.0, 0.0); bins]; nch],
+            log_mag: vec![0f64; bins],
+            a: vec![0f64; bins],
+            env: vec![0f64; bins],
+            scratch: vec![Complex::new(0.0, 0.0); bins],
+            mono_mag: vec![0f64; bins],
+        }
+    }
+}
+
 /// Filters `channels` in place so their envelope reads `H(s·f)` at `f`.
+///
+/// Frames are corrected on up to `threads` workers in batches; each batch is then
+/// overlap-added in frame order, so the result does not depend on the thread count.
 pub fn prewarp(
     channels: &mut [Vec<f32>],
     fs: u32,
     s: f64,
     f0_ref_hz: f64,
+    threads: usize,
     progress: &mut dyn FnMut(usize, usize),
 ) -> FormantStats {
     let n = pow2_near_ms(FRAME_MS, fs);
@@ -95,15 +127,7 @@ pub fn prewarp(
     let win = hann_periodic(n);
     // Periodic Hann at hop n/4 overlap-adds to exactly 2.
     let ola_gain = 0.5f32;
-    let mut fft = RealFft::new(k);
     let mut out = vec![vec![0f32; len]; nch];
-    let mut frame = vec![0f32; k];
-    let mut chan_spec: Vec<Vec<Complex>> = vec![vec![Complex::new(0.0, 0.0); bins]; nch];
-    let mut log_mag = vec![0f64; bins];
-    let mut a = vec![0f64; bins];
-    let mut env = vec![0f64; bins];
-    let mut scratch = vec![Complex::new(0.0, 0.0); bins];
-    let mut mono_mag = vec![0f64; bins];
     let floor_ratio = 10f64.powf(FLOOR_DB / 20.0);
     let conv = CONVERGENCE_DB / 20.0 * std::f64::consts::LN_10;
     let max_gain = MAX_GAIN_DB / 20.0 * std::f64::consts::LN_10;
@@ -112,56 +136,59 @@ pub fn prewarp(
     // Frame centres from −n/2 to len + n/2 so every sample gets the full window sum.
     let first = -(n as i64 / 2);
     let total = (len as i64 + n as i64 / 2 - first) as usize / hop + 1;
-    for f in 0..total {
-        let c = first + (f * hop) as i64;
+    let centre = |f: usize| first + (f * hop) as i64;
+    let input: &[Vec<f32>] = channels;
+    // Corrected `2n`-sample frame per channel and the iteration count, or `None` for a
+    // silent frame.
+    let correct = |f: usize, w: &mut FrameScratch| -> Option<(Vec<Vec<f32>>, usize)> {
+        let c = centre(f);
         // Windowed frame in the middle of a 2n buffer: index i ↔ sample c − n + i.
         let mut any = false;
-        mono_mag.fill(0.0);
-        for ch in 0..nch {
-            frame.fill(0.0);
-            for (w_i, &w) in win.iter().enumerate() {
+        w.mono_mag.fill(0.0);
+        for (x, spec) in input.iter().zip(w.chan_spec.iter_mut()) {
+            w.frame.fill(0.0);
+            for (w_i, &wv) in win.iter().enumerate() {
                 let t = c - (n as i64) / 2 + w_i as i64;
                 if (0..len as i64).contains(&t) {
-                    let v = channels[ch][t as usize] * w;
+                    let v = x[t as usize] * wv;
                     any |= v != 0.0;
-                    frame[n / 2 + w_i] = v;
+                    w.frame[n / 2 + w_i] = v;
                 }
             }
-            chan_spec[ch].copy_from_slice(fft.forward(&frame));
+            spec.copy_from_slice(w.fft.forward(&w.frame));
         }
         if !any {
-            progress(f, total);
-            continue;
+            return None;
         }
         // Envelope of the channel mean.
-        for (b, m) in mono_mag.iter_mut().enumerate() {
-            let sum: Complex = chan_spec.iter().map(|s| s[b]).sum();
+        for (b, m) in w.mono_mag.iter_mut().enumerate() {
+            let sum: Complex = w.chan_spec.iter().map(|s| s[b]).sum();
             *m = (sum.norm() / nch as f32) as f64;
         }
-        let peak = mono_mag.iter().fold(0f64, |p, &v| p.max(v));
+        let peak = w.mono_mag.iter().fold(0f64, |p, &v| p.max(v));
         let floor = (peak * floor_ratio).max(1e-30);
-        for (l, &m) in log_mag.iter_mut().zip(&mono_mag) {
+        for (l, &m) in w.log_mag.iter_mut().zip(&w.mono_mag) {
             *l = (m + floor).ln();
         }
-        a.copy_from_slice(&log_mag);
+        w.a.copy_from_slice(&w.log_mag);
         let mut iters = 0;
         loop {
-            cepstral_smooth(&mut fft, &a, order, &mut scratch, &mut env);
+            cepstral_smooth(&mut w.fft, &w.a, order, &mut w.scratch, &mut w.env);
             iters += 1;
-            let gap = log_mag
+            let gap = w
+                .log_mag
                 .iter()
-                .zip(&env)
+                .zip(&w.env)
                 .fold(f64::NEG_INFINITY, |g, (&l, &e)| g.max(l - e));
             if gap < conv || iters >= MAX_ITERATIONS {
                 break;
             }
-            for (ai, &e) in a.iter_mut().zip(&env) {
+            for (ai, &e) in w.a.iter_mut().zip(&w.env) {
                 *ai = ai.max(e);
             }
         }
-        total_iters += iters;
-        stats.frames += 1;
         // Gain G(f) = H(s·f) / H(f), clamped; bins mapped past Nyquist read H(Nyquist).
+        let env = &w.env;
         for b in 0..bins {
             let x = b as f64 * s;
             let target = if x >= (bins - 1) as f64 {
@@ -172,23 +199,42 @@ pub fn prewarp(
                 env[i] + fr * (env[i + 1] - env[i])
             };
             let g = (target - env[b]).clamp(-max_gain, max_gain).exp() as f32;
-            for spec in chan_spec.iter_mut() {
+            for spec in w.chan_spec.iter_mut() {
                 spec[b] *= g;
             }
         }
-        for ch in 0..nch {
-            let y = fft.inverse(&chan_spec[ch]);
-            let base = c - n as i64;
-            for (i, &v) in y.iter().enumerate() {
-                let t = base + i as i64;
-                if (0..len as i64).contains(&t) {
-                    out[ch][t as usize] += v * ola_gain;
+        let ys = (0..nch)
+            .map(|ch| w.fft.inverse(&w.chan_spec[ch]).to_vec())
+            .collect();
+        Some((ys, iters))
+    };
+
+    // Batches bound the memory held for corrected frames.
+    let batch = threads.max(1) * 32;
+    let mut f0 = 0;
+    while f0 < total {
+        let f1 = (f0 + batch).min(total);
+        let parts = crate::par::chunks(f1 - f0, threads, 8, |r| {
+            let mut w = FrameScratch::new(k, nch);
+            r.map(|i| correct(f0 + i, &mut w)).collect::<Vec<_>>()
+        });
+        for (f, res) in (f0..f1).zip(parts.into_iter().flatten()) {
+            let Some((ys, iters)) = res else { continue };
+            total_iters += iters;
+            stats.frames += 1;
+            let base = centre(f) - n as i64;
+            for (ch, y) in ys.iter().enumerate() {
+                for (i, &v) in y.iter().enumerate() {
+                    let t = base + i as i64;
+                    if (0..len as i64).contains(&t) {
+                        out[ch][t as usize] += v * ola_gain;
+                    }
                 }
             }
         }
-        progress(f, total);
+        progress(f1, total);
+        f0 = f1;
     }
-    progress(total, total);
     stats.mean_iterations = total_iters as f64 / stats.frames.max(1) as f64;
     for (dst, src) in channels.iter_mut().zip(out) {
         *dst = src;
@@ -211,7 +257,7 @@ mod tests {
             })
             .collect();
         let mut ch = vec![x.clone()];
-        prewarp(&mut ch, fs, 1.0, 150.0, &mut |_, _| {});
+        prewarp(&mut ch, fs, 1.0, 150.0, 2, &mut |_, _| {});
         let err = x
             .iter()
             .zip(&ch[0])
@@ -222,7 +268,7 @@ mod tests {
     #[test]
     fn silence_stays_silent() {
         let mut ch = vec![vec![0f32; 3000]; 2];
-        let st = prewarp(&mut ch, 16_000, 1.5, 200.0, &mut |_, _| {});
+        let st = prewarp(&mut ch, 16_000, 1.5, 200.0, 2, &mut |_, _| {});
         assert_eq!(st.frames, 0);
         assert!(ch.iter().flatten().all(|&v| v == 0.0));
     }

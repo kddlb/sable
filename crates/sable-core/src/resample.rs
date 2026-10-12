@@ -66,6 +66,8 @@ pub struct Resampler {
     two_fc: f64,
     /// Kernel half-width in input samples.
     half: f64,
+    /// Worker threads for [`Resampler::process`] (output frames are independent).
+    threads: usize,
 }
 
 impl Resampler {
@@ -78,7 +80,14 @@ impl Resampler {
             n,
             two_fc,
             half: ZERO_CROSSINGS as f64 / two_fc,
+            threads: 1,
         }
+    }
+
+    /// Uses up to `threads` workers (`0` = all cores). The result does not depend on it.
+    pub fn with_threads(mut self, threads: usize) -> Self {
+        self.threads = crate::par::threads(threads);
+        self
     }
 
     #[inline]
@@ -101,7 +110,7 @@ impl Resampler {
             return y;
         }
         let last = self.m as i64 - 1;
-        for (j, out) in y.iter_mut().enumerate() {
+        let frame = |j: usize| -> f32 {
             let t = source_pos(j, self.m, self.n);
             let a = ((t - self.half).ceil() as i64).max(0);
             let b = ((t + self.half).floor() as i64).min(last);
@@ -109,10 +118,19 @@ impl Resampler {
             for i in a..=b {
                 acc += x[i as usize] as f64 * self.kernel(t - i as f64);
             }
-            *out = acc as f32;
-            if j % 4096 == 0 {
-                progress(j, self.n);
+            acc as f32
+        };
+        // Blocks keep progress reporting on the calling thread.
+        const BLOCK: usize = 1 << 16;
+        for (bi, block) in y.chunks_mut(BLOCK).enumerate() {
+            let j0 = bi * BLOCK;
+            let parts = crate::par::chunks(block.len(), self.threads, 4096, |r| {
+                r.map(|k| frame(j0 + k)).collect::<Vec<f32>>()
+            });
+            for (o, v) in block.iter_mut().zip(parts.into_iter().flatten()) {
+                *o = v;
             }
+            progress(j0, self.n);
         }
         progress(self.n, self.n);
         y

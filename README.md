@@ -27,7 +27,8 @@ For stretch factor `r = p/q = duration_out / duration_in` (so `r > 1` makes the 
   padding or truncation.
 * `r = 1` returns sample-identical audio, including signed zeros.
 * All-zero input yields exact zeros at any factor.
-* Same input, options and seed produce bit-identical output and report.
+* Same input, options and seed produce bit-identical output and report, for any thread
+  count.
 * Invalid input (NaN/Inf, unequal channel lengths, sample rate outside 8–96 kHz, more
   than 2 channels, zero ratio, zero rounded output length, size limits) returns a typed
   `StretchError` and never panics.
@@ -53,6 +54,7 @@ target/release/sable -i speech.wav -o faster.wav -s 0.75 --seed 42 \
 | `--duration D` | instead of `--stretch`: hit an exact output duration, e.g. to fit a disclaimer read into a slot. `D` is seconds (`29.5`, `29.5s`), `1500ms`, clock time (`0:29.5`, `1:02.250`) or a frame count (`720000f`), parsed exactly and rounded to the nearest frame. The factor becomes `N_target / N_in`, so the output has exactly `N_target` frames. Applies to the input after any silence trimming. |
 | `--max-duration D` | like `--duration`, but only shortens: an input already within `D` keeps its length (factor 1) |
 | `--seed` | seed for sibilant noise (default fixed) |
+| `--threads N` | worker threads for analysis, sibilant synthesis, formant correction and resampling (default 0 = all cores). The output is bit-identical for every value. See [ALGORITHM §11a](docs/ALGORITHM.md). |
 | `--diagnostics FILE` | JSON report: frame counts, segment table with local ratios, detector scores, allocator stage, overlay decisions, WSOLA stats, peak/RMS before and after |
 | `--features` | also include per-frame analysis features in the report |
 | `--dump-dir DIR` | write `baseline`, `after_plosive`, `plosive_mask`, `sibilant_mask`, `sibilant_noise` WAVs (all exactly `N_out` frames) |

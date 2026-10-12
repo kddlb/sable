@@ -72,6 +72,10 @@ struct Cli {
     /// Print each processing phase with its timing to stderr as it finishes.
     #[arg(long)]
     progress: bool,
+    /// Worker threads for the parallel stages (0 = all cores). The output is identical
+    /// for every value.
+    #[arg(long, default_value_t = 0)]
+    threads: usize,
     /// Seed for deterministic noise resynthesis.
     #[arg(long, default_value_t = Options::default().seed)]
     seed: u64,
@@ -176,6 +180,7 @@ fn run(cli: Cli) -> Result<(), String> {
         Options::default()
     };
     opts.seed = cli.seed;
+    opts.threads = cli.threads;
     opts.diagnostics = cli.features;
     opts.quality = match cli.quality {
         Quality::Fast => QualityPreset::Fast,

@@ -33,6 +33,7 @@ pub mod filters;
 pub mod formant;
 pub mod metrics;
 pub mod options;
+pub mod par;
 pub mod pipeline;
 pub mod plosives;
 pub mod progress;
@@ -230,9 +231,15 @@ fn render_pitched(
 
     let formant = (options.formants == FormantMode::Preserve).then(|| {
         progress.start(Phase::Formants);
-        let st = formant::prewarp(&mut channels, fs, s, rendered.f0_ref_hz, &mut |d, t| {
-            progress.step(Phase::Formants, d, t)
-        });
+        let threads = par::threads(options.threads);
+        let st = formant::prewarp(
+            &mut channels,
+            fs,
+            s,
+            rendered.f0_ref_hz,
+            threads,
+            &mut |d, t| progress.step(Phase::Formants, d, t),
+        );
         progress.finish(
             Phase::Formants,
             format!(
@@ -244,7 +251,7 @@ fn render_pitched(
     });
 
     progress.start(Phase::Resample);
-    let rs = resample::Resampler::new(m as usize, n_out as usize);
+    let rs = resample::Resampler::new(m as usize, n_out as usize).with_threads(options.threads);
     let n = n_out as usize;
     let mut layers = rendered.layers;
     let mut jobs: Vec<&mut Vec<f32>> = channels.iter_mut().collect();

@@ -1,4 +1,5 @@
-//! Throughput benchmark (no external harness): realtime factor = audio seconds / CPU seconds.
+//! Throughput benchmark (no external harness): realtime factor = audio seconds / wall
+//! seconds, on one thread and on all cores.
 //!
 //! ```text
 //! cargo bench -p sable-core --bench speech
@@ -21,6 +22,20 @@ fn tile(a: &AudioBuffer, seconds: f64) -> AudioBuffer {
     }
 }
 
+/// Best of 3 (after a warm-up) in seconds.
+fn best_time(view: &AudioView<'_>, r: StretchRatio, opts: &Options) -> f64 {
+    let _ = stretch(view, r, opts).unwrap();
+    let mut best = f64::MAX;
+    for _ in 0..3 {
+        let t = Instant::now();
+        let out = stretch(view, r, opts).unwrap();
+        best = best.min(t.elapsed().as_secs_f64());
+        std::hint::black_box(out);
+    }
+    best
+}
+
+/// Realtime factor on one thread and on all cores (the output is identical).
 fn bench(label: &str, audio: &AudioBuffer, f: &str, opts: &Options) {
     let refs = audio.view_refs();
     let view = AudioView {
@@ -28,21 +43,30 @@ fn bench(label: &str, audio: &AudioBuffer, f: &str, opts: &Options) {
         channels: &refs,
     };
     let r = StretchRatio::parse(f).unwrap();
-    // Warm-up + 3 timed runs; report the best.
-    let _ = stretch(&view, r, opts).unwrap();
-    let mut best = f64::MAX;
-    for _ in 0..3 {
-        let t = Instant::now();
-        let out = stretch(&view, r, opts).unwrap();
-        best = best.min(t.elapsed().as_secs_f64());
-        std::hint::black_box(out);
-    }
     let secs = audio.frames() as f64 / audio.sample_rate as f64;
+    let one = best_time(
+        &view,
+        r,
+        &Options {
+            threads: 1,
+            ..opts.clone()
+        },
+    );
+    let all = best_time(
+        &view,
+        r,
+        &Options {
+            threads: 0,
+            ..opts.clone()
+        },
+    );
     println!(
-        "{label:<34} r={f:<5} {:>6.2} s audio  {:>8.1} ms  {:>7.1}x realtime",
+        "{label:<34} r={f:<5} {:>6.2} s audio  1 thread {:>7.1} ms {:>6.1}x  all cores {:>7.1} ms {:>6.1}x realtime",
         secs,
-        best * 1000.0,
-        secs / best
+        one * 1000.0,
+        secs / one,
+        all * 1000.0,
+        secs / all
     );
 }
 

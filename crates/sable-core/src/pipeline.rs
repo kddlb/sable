@@ -231,7 +231,11 @@ pub fn render(
     let n_in = input.frames() as u64;
     let r = ratio.as_f64();
     progress.start(Phase::Analysis);
-    let feats = features::analyze(input.channels, fs, &FeatureConfig::default());
+    let feat_cfg = FeatureConfig {
+        threads: opts.threads,
+        ..FeatureConfig::default()
+    };
+    let feats = features::analyze(input.channels, fs, &feat_cfg);
     if opts.diagnostics {
         report.features = Some(feature_dump(&feats));
     }

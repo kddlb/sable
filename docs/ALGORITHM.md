@@ -81,6 +81,25 @@ Special cases:
 * Invalid input (NaN, unequal channel lengths, a sample rate outside 8–96 kHz) returns a
   typed error instead of crashing.
 
+### 2a. Time targeting (`target.rs`)
+
+Instead of a factor you can ask for an output **duration**, for example to fit a
+disclaimer read into a 15-second slot. The duration is parsed exactly, like the factor:
+`29.5`, `29.5s`, `1500ms`, clock time `0:29.5` / `1:02.250`, or a frame count `720000f`.
+It is converted to a frame count at the input's sample rate, rounding to the nearest frame
+(ties up):
+
+```
+N_target = floor(seconds · fs + 1/2)
+r        = N_target / N_in            (reduced fraction)
+```
+
+With that `r`, the length formula above gives `floor(N_in · N_target / N_in + 1/2) =
+N_target` for any `N_in > 0`, so the target is hit exactly, by the same machinery as any
+other factor. In **at most** mode the factor is `min(1, N_target / N_in)`: a read that
+already fits is left alone. A target is useful only for the speech itself, so the front
+ends can first trim silence at both ends (§11), and `N_in` is then the trimmed length.
+
 ---
 
 ## 3. Analysis (`features.rs`)
@@ -283,6 +302,27 @@ stable formula, `v = 2w / ((1+k) + sqrt((1+k)² − 4kw))`.
   does.
 * Output = Σ(window × grain) ÷ Σ(window), into a buffer of exactly `N_out` frames.
 
+**How the search is computed.** It is most of the run time, so it is written for speed
+without changing a single output bit:
+
+* The candidate positions are scanned every 2–3 samples first (coarse step
+  `fs / 16 kHz`; `fs / 24 kHz` for High), then refined around the best one at full
+  resolution. The first maximum
+  in scan order wins, as in a plain loop.
+* The source signals are padded once with their mirror images, so every read is a plain
+  slice instead of a per-sample reflection (which needed an integer division).
+* The template's energy does not depend on the candidate, so it is computed once per
+  grain and decimation step.
+* Eight candidates are scored in the same pass over the template. Each candidate keeps
+  its own sums, added in the original order, so the scores are bit-identical. The CPU
+  just gets eight independent addition chains instead of one, which hides the latency of
+  each `f64` add.
+* Burst onsets are kept sorted, so "does this grain straddle a burst?" is a binary
+  search instead of a scan of all bursts.
+
+WSOLA itself stays sequential: each grain is matched against output that earlier grains
+wrote.
+
 Grain positions follow the time map, so WSOLA stretches each segment by its own budgeted
 amount. That is the "variable rate".
 
@@ -393,15 +433,55 @@ settings. Two consequences:
 * **Input formats** (CLI/GUI): WAV via `hound`; FLAC, MP3, Ogg Vorbis, AAC/ALAC (M4A),
   AIFF, CAF and MKV/WebM via `symphonia`. Output is WAV. Lossy MP3/AAC files may contain
   encoder padding, and the exact length then applies to the decoded signal.
-* **Skip leading silence** (optional) trims the start before stretching, keeping 20 ms
-  before the first sound.
+* **Skip leading / trailing silence** (optional) trims the ends before stretching,
+  keeping 20 ms before the first sound and 50 ms after the last one. Sound is anything at
+  or above a threshold (−50 dBFS RMS over 5 ms on the louder channel by default). The
+  exact length, and a target duration (§2a), then apply to the trimmed input.
 * **Diagnostics:** every run reports the exact frame counts, the segment table (input
   span, output span, local factor, warp, scores, reasons), the burst candidates with all
   their factors, each overlay decision and why, the relaxation stage, warnings, and the
   levels before and after. Intermediate layers (baseline, after bursts, masks, synthetic
   noise) can be written out as WAV files.
 * **Determinism:** the same input, options and seed give bit-identical output and report.
-  There is no threading, no unordered iteration, and the noise generator is seeded.
+  There is no unordered iteration and the noise generator is seeded. Threads are used
+  only where the work splits into independent pieces whose results are put back in order,
+  so the thread count never changes a bit of the output (§11a).
+
+### 11a. Speed and threads (`par.rs`)
+
+On one core SABLE runs about 25–170× faster than real time, depending on sample rate,
+factor and material (see [`QUALITY.md`](../QUALITY.md)). Extra cores help the stages that
+split into independent pieces. `Options::threads` (`--threads` on the CLI) sets the
+worker count: `0` uses all cores and `1` keeps everything on the calling thread.
+
+| stage | how it splits | parallel? |
+|---|---|---|
+| analysis features, pitch track | contiguous runs of frames; each run recomputes the one previous spectrum that spectral flux needs | yes |
+| event detection, budget, time map | sequential, and cheap | no |
+| WSOLA | each grain depends on the output so far | no (but see §7) |
+| burst copy | trivial | no |
+| sibilant resynthesis | one job per sibilant: spectral template, seeded noise, calibration. The checks, report entries and mixing stay in segment order. | yes |
+| formant correction | frames in batches; envelopes in parallel, then overlap-added in frame order | yes |
+| resampling | blocks of output samples | yes |
+
+Two rules keep the result independent of the thread count: each piece computes exactly
+what the sequential loop would have computed for it, and any sum that crosses pieces
+(overlap-add, report order) is done afterwards in the original order. A test checks
+1, 2, 3 and 8 threads against each other, bit for bit, on mono, stereo and pitch-shifted
+runs.
+
+Workers are scoped `std` threads started for each stage. That suits files. It does not
+suit a live audio callback, which must not spawn threads. Live use would also need the
+design changes listed below, because several steps need the whole recording:
+
+* the budget (§5) solves for one λ across every segment so that they sum to `N_out`,
+  and `N_out` comes from the total input length;
+* detection uses statistics of the whole clip (noise floor, speech level, F0 reference);
+* a target duration (§2a) needs the input length before it can pick a factor.
+
+A streaming variant would detect with a fixed lookahead, budget one chunk at a time while
+keeping the running output length equal to `floor(N_in so far · p/q + 1/2)` at every
+commit, and run WSOLA over a ring buffer. That is not implemented.
 
 ---
 
@@ -410,6 +490,7 @@ settings. Two consequences:
 | Step | File |
 |---|---|
 | exact fraction, `N_out` | `crates/sable-core/src/ratio.rs` |
+| target duration → factor | `target.rs` |
 | analysis features, dry-centre reference | `features.rs` |
 | event detection, burst scoring | `detect.rs`, `segments.rs` |
 | duration budget | `budget.rs` |
@@ -419,7 +500,8 @@ settings. Two consequences:
 | sibilant template and noise | `sibilants.rs`, `stereo.rs`, `filters.rs`, `rng.rs` |
 | orchestration, mid/side | `pipeline.rs` |
 | reports | `report.rs` |
-| file I/O, silence skip, GUI | `crates/sable-cli/` |
+| thread helpers | `par.rs` |
+| file I/O, silence trimming, GUI | `crates/sable-cli/` |
 
 Useful tools:
 

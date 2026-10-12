@@ -33,15 +33,24 @@ missing fricative, vowel warble, changed F0, click at event edge, unbalanced ste
 ## Performance
 
 `cargo bench -p sable-core --bench speech`. Measured 2026-10-12 on the development machine
-(Windows 11, release build, single thread), best of 3:
+(Windows 11, release build, 24 logical cores), best of 3, 10 s of audio. *1 thread* is
+`Options::threads = 1`; *all cores* is the default. The output is bit-identical either way.
 
-| material | r | realtime factor |
-|---|---:|---:|
-| synthetic utterance, 16 kHz mono, SABLE | 0.75 / 1.5 | 70× / 40× |
-| synthetic utterance, 48 kHz mono, SABLE | 0.75 / 1.5 | 40× / 27× |
-| same, generic WSOLA | 0.75 / 1.5 | 67× / 38× |
-| same, SABLE `Fast` preset | 0.75 / 1.5 | 47× / 34× |
-| stereo /s/ (sibilant-heavy), 48 kHz, SABLE | 0.75 / 1.5 | 24× / 18× |
+| material | r | 1 thread | all cores |
+|---|---:|---:|---:|
+| synthetic utterance, 16 kHz mono, SABLE | 0.75 / 1.5 | 170× / 125× | 330× / 200× |
+| synthetic utterance, 48 kHz mono, SABLE | 0.75 / 1.5 | 62× / 50× | 181× / 118× |
+| same, generic WSOLA | 0.75 / 1.5 | 167× / 116× | 270× / 162× |
+| same, SABLE `Fast` preset | 0.75 / 1.5 | 65× / 53× | 200× / 137× |
+| stereo /s/ (sibilant-heavy), 48 kHz, SABLE | 0.75 / 1.5 | 28× / 25× | 111× / 87× |
+
+Before the 2026-10-12 speed-up (single-threaded, same machine) the same rows read
+68×/38×, 37×/26×, 66×/34×, 47×/32× and 21×/17×. On the local speech recordings plus a
+disclaimer read (8 files × 5 settings, including pitch shifts) total processing time went
+from 15.2 s to 6.6 s on one thread and 3.3 s on all cores, with every output identical to
+the previous version. On one thread nearly all of the gain is in WSOLA (10.8 s → 2.0 s);
+analysis, sibilant synthesis, formant correction and resampling gain only from extra
+cores.
 
 Peak memory is dominated by the `f64` overlap-add accumulators:
 about `N_out × (channels + 2) × 8` bytes, plus the input and output buffers.
@@ -147,41 +156,41 @@ Coherence = mean magnitude-squared coherence, 4–12 kHz. *S/M* = side-to-mid en
 
 | file | ch | r | N_in | N_out | stage | bursts copied | sibilants resynth. (of detected) | time |
 |---|---:|---:|---:|---:|:---:|---:|---:|---:|
-| speech 1 | 1 | 0.65 | 437325 | 284261 | A | 11 | 7 (8) | 147 ms |
-| speech 1 | 1 | 0.75 | 437325 | 327994 | A | 11 | 7 (8) | 161 ms |
-| speech 1 | 1 | 1.25 | 437325 | 546656 | A | 11 | 7 (8) | 238 ms |
-| speech 1 | 1 | 1.5 | 437325 | 655988 | A | 11 | 7 (8) | 265 ms |
-| speech 1 | 1 | 2 | 437325 | 874650 | A | 11 | 7 (8) | 333 ms |
-| speech 2 | 2 | 0.65 | 424603 | 275992 | A | 3 | 6 (6) | 182 ms |
-| speech 2 | 2 | 0.75 | 424603 | 318452 | A | 3 | 6 (6) | 198 ms |
-| speech 2 | 2 | 1.25 | 424603 | 530754 | A | 3 | 6 (6) | 261 ms |
-| speech 2 | 2 | 1.5 | 424603 | 636905 | A | 3 | 6 (6) | 292 ms |
-| speech 2 | 2 | 2 | 424603 | 849206 | A | 3 | 6 (6) | 371 ms |
-| speech 3 | 2 | 0.65 | 1104000 | 717600 | A | 6 | 6 (12) | 426 ms |
-| speech 3 | 2 | 0.75 | 1104000 | 828000 | A | 6 | 6 (12) | 464 ms |
-| speech 3 | 2 | 1.25 | 1104000 | 1380000 | A | 6 | 6 (12) | 642 ms |
-| speech 3 | 2 | 1.5 | 1104000 | 1656000 | A | 6 | 6 (12) | 732 ms |
-| speech 3 | 2 | 2 | 1104000 | 2208000 | A | 6 | 6 (12) | 879 ms |
-| speech 4 | 1 | 0.65 | 107136 | 69638 | A | 6 | 2 (2) | 57 ms |
-| speech 4 | 1 | 0.75 | 107136 | 80352 | A | 6 | 2 (2) | 63 ms |
-| speech 4 | 1 | 1.25 | 107136 | 133920 | A | 6 | 2 (2) | 94 ms |
-| speech 4 | 1 | 1.5 | 107136 | 160704 | A | 6 | 2 (2) | 110 ms |
-| speech 4 | 1 | 2 | 107136 | 214272 | A | 6 | 2 (2) | 135 ms |
-| speech 5 | 1 | 0.65 | 114048 | 74131 | A | 8 | 2 (2) | 54 ms |
-| speech 5 | 1 | 0.75 | 114048 | 85536 | A | 8 | 2 (2) | 61 ms |
-| speech 5 | 1 | 1.25 | 114048 | 142560 | A | 8 | 2 (2) | 97 ms |
-| speech 5 | 1 | 1.5 | 114048 | 171072 | A | 8 | 2 (2) | 111 ms |
-| speech 5 | 1 | 2 | 114048 | 228096 | A | 8 | 2 (2) | 140 ms |
-| speech 6 | 1 | 0.65 | 110592 | 71885 | A | 7 | 2 (2) | 54 ms |
-| speech 6 | 1 | 0.75 | 110592 | 82944 | A | 7 | 2 (2) | 61 ms |
-| speech 6 | 1 | 1.25 | 110592 | 138240 | A | 7 | 2 (2) | 95 ms |
-| speech 6 | 1 | 1.5 | 110592 | 165888 | A | 7 | 2 (2) | 109 ms |
-| speech 6 | 1 | 2 | 110592 | 221184 | A | 7 | 2 (2) | 136 ms |
-| speech 7 | 1 | 0.65 | 199296 | 129542 | A | 4 | 7 (8) | 132 ms |
-| speech 7 | 1 | 0.75 | 199296 | 149472 | A | 4 | 7 (8) | 144 ms |
-| speech 7 | 1 | 1.25 | 199296 | 249120 | A | 4 | 7 (8) | 202 ms |
-| speech 7 | 1 | 1.5 | 199296 | 298944 | A | 4 | 7 (8) | 229 ms |
-| speech 7 | 1 | 2 | 199296 | 398592 | A | 4 | 7 (8) | 283 ms |
+| speech 1 | 1 | 0.65 | 437325 | 284261 | A | 11 | 7 (8) | 39 ms |
+| speech 1 | 1 | 0.75 | 437325 | 327994 | A | 11 | 7 (8) | 43 ms |
+| speech 1 | 1 | 1.25 | 437325 | 546656 | A | 11 | 7 (8) | 61 ms |
+| speech 1 | 1 | 1.5 | 437325 | 655988 | A | 11 | 7 (8) | 65 ms |
+| speech 1 | 1 | 2 | 437325 | 874650 | A | 11 | 7 (8) | 79 ms |
+| speech 2 | 2 | 0.65 | 424603 | 275992 | A | 3 | 6 (6) | 56 ms |
+| speech 2 | 2 | 0.75 | 424603 | 318452 | A | 3 | 6 (6) | 60 ms |
+| speech 2 | 2 | 1.25 | 424603 | 530754 | A | 3 | 6 (6) | 74 ms |
+| speech 2 | 2 | 1.5 | 424603 | 636905 | A | 3 | 6 (6) | 82 ms |
+| speech 2 | 2 | 2 | 424603 | 849206 | A | 3 | 6 (6) | 99 ms |
+| speech 3 | 2 | 0.65 | 1104000 | 717600 | A | 6 | 6 (12) | 141 ms |
+| speech 3 | 2 | 0.75 | 1104000 | 828000 | A | 6 | 6 (12) | 148 ms |
+| speech 3 | 2 | 1.25 | 1104000 | 1380000 | A | 6 | 6 (12) | 196 ms |
+| speech 3 | 2 | 1.5 | 1104000 | 1656000 | A | 6 | 6 (12) | 214 ms |
+| speech 3 | 2 | 2 | 1104000 | 2208000 | A | 6 | 6 (12) | 245 ms |
+| speech 4 | 1 | 0.65 | 107136 | 69638 | A | 6 | 2 (2) | 17 ms |
+| speech 4 | 1 | 0.75 | 107136 | 80352 | A | 6 | 2 (2) | 17 ms |
+| speech 4 | 1 | 1.25 | 107136 | 133920 | A | 6 | 2 (2) | 23 ms |
+| speech 4 | 1 | 1.5 | 107136 | 160704 | A | 6 | 2 (2) | 27 ms |
+| speech 4 | 1 | 2 | 107136 | 214272 | A | 6 | 2 (2) | 32 ms |
+| speech 5 | 1 | 0.65 | 114048 | 74131 | A | 8 | 2 (2) | 17 ms |
+| speech 5 | 1 | 0.75 | 114048 | 85536 | A | 8 | 2 (2) | 17 ms |
+| speech 5 | 1 | 1.25 | 114048 | 142560 | A | 8 | 2 (2) | 24 ms |
+| speech 5 | 1 | 1.5 | 114048 | 171072 | A | 8 | 2 (2) | 29 ms |
+| speech 5 | 1 | 2 | 114048 | 228096 | A | 8 | 2 (2) | 33 ms |
+| speech 6 | 1 | 0.65 | 110592 | 71885 | A | 7 | 2 (2) | 17 ms |
+| speech 6 | 1 | 0.75 | 110592 | 82944 | A | 7 | 2 (2) | 20 ms |
+| speech 6 | 1 | 1.25 | 110592 | 138240 | A | 7 | 2 (2) | 25 ms |
+| speech 6 | 1 | 1.5 | 110592 | 165888 | A | 7 | 2 (2) | 28 ms |
+| speech 6 | 1 | 2 | 110592 | 221184 | A | 7 | 2 (2) | 34 ms |
+| speech 7 | 1 | 0.65 | 199296 | 129542 | A | 4 | 7 (8) | 34 ms |
+| speech 7 | 1 | 0.75 | 199296 | 149472 | A | 4 | 7 (8) | 37 ms |
+| speech 7 | 1 | 1.25 | 199296 | 249120 | A | 4 | 7 (8) | 48 ms |
+| speech 7 | 1 | 1.5 | 199296 | 298944 | A | 4 | 7 (8) | 53 ms |
+| speech 7 | 1 | 2 | 199296 | 398592 | A | 4 | 7 (8) | 69 ms |
 
 ### Stereo recordings: L/R mode vs M/S mode (r = 1.5)
 

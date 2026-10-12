@@ -24,6 +24,9 @@ pub struct FeatureConfig {
     /// STFT bin. Diffuse reverb and decorrelated ambience sit roughly equally in mid and
     /// side, so this keeps stop closures and pauses from filling with reverb tail.
     pub center_analysis: bool,
+    /// Worker threads for the per-frame analysis (`0` = all cores). Results do not
+    /// depend on it.
+    pub threads: usize,
 }
 
 impl Default for FeatureConfig {
@@ -38,6 +41,7 @@ impl Default for FeatureConfig {
             hf_edge_hz: 2500.0,
             low_band_hz: 1500.0,
             fine_block_ms: 1.0,
+            threads: 0,
             center_analysis: true,
         }
     }
@@ -277,15 +281,6 @@ pub fn analyze(channels: &[&[f32]], fs: u32, cfg: &FeatureConfig) -> Features {
     let k_low = ((80.0 / bin_hz).ceil() as usize).max(1);
     let k_lowband = ((cfg.low_band_hz / bin_hz).round() as usize).min(bins - 1);
 
-    let mut log_rms = vec![0f32; nf];
-    let mut flux = vec![0f32; nf];
-    let mut hf_ratio = vec![0f32; nf];
-    let mut flatness = vec![0f32; nf];
-    let mut centroid = vec![0f32; nf];
-    let mut zcr = vec![0f32; nf];
-    let mut low_frac = vec![0f32; nf];
-    let mut hf_ratio_upper = vec![0f32; nf];
-
     // Running prefix sums for RMS.
     let mut pre = vec![0f64; n + 1];
     for i in 0..n {
@@ -293,77 +288,105 @@ pub fn analyze(channels: &[&[f32]], fs: u32, cfg: &FeatureConfig) -> Features {
     }
 
     let win = hann_periodic(nfft);
-    let mut fft = RealFft::new(nfft);
-    let mut buf = vec![0f32; nfft];
-    let mut prev_mag = vec![0f32; bins];
-    let mut pw = vec![0f64; bins];
     let flat_band = ((500.0 / bin_hz).round() as usize).max(4);
-    let mut mag = vec![0f32; bins];
-    for j in 0..nf {
-        let c = (j * hop + hop / 2) as isize;
-        // RMS
-        let a = (c - rms_len as isize / 2).clamp(0, n as isize) as usize;
-        let b = (c + rms_len as isize / 2).clamp(0, n as isize) as usize;
-        let e = if b > a {
-            (pre[b] - pre[a]) / rms_len as f64
-        } else {
-            0.0
-        };
-        log_rms[j] = (10.0 * (e + EPS).log10()) as f32;
-        // ZCR
-        let mut zc = 0;
-        for i in a.max(1)..b {
-            if (mono[i] >= 0.0) != (mono[i - 1] >= 0.0) {
-                zc += 1;
-            }
+    let threads = crate::par::threads(cfg.threads);
+    // Frames are independent except for spectral flux, which needs the previous frame's
+    // magnitudes; each chunk recomputes those for its first frame.
+    let chunks = crate::par::chunks(nf, threads, 64, |range| {
+        let mut fr = FrameFeatures::with_capacity(range.len());
+        let mut fft = RealFft::new(nfft);
+        let mut buf = vec![0f32; nfft];
+        let mut prev_mag = vec![0f32; bins];
+        let mut pw = vec![0f64; bins];
+        let mut mag = vec![0f32; bins];
+        let spectrum =
+            |j: usize, fft: &mut RealFft, buf: &mut [f32], pw: &mut [f64], mag: &mut [f32]| {
+                let c = (j * hop + hop / 2) as isize;
+                let start = c - nfft as isize / 2;
+                for (k, v) in buf.iter_mut().enumerate() {
+                    *v = read(&mono, start + k as isize);
+                }
+                let spec = fft.forward_windowed(buf, &win);
+                for k in 0..bins {
+                    let p = spec[k].norm_sqr() as f64;
+                    mag[k] = p.sqrt() as f32;
+                    pw[k] = p;
+                }
+            };
+        if range.start > 0 {
+            spectrum(range.start - 1, &mut fft, &mut buf, &mut pw, &mut prev_mag);
         }
-        zcr[j] = if b > a {
-            zc as f32 / (b - a) as f32
-        } else {
-            0.0
-        };
-        // Spectrum
-        let start = c - nfft as isize / 2;
-        for (k, v) in buf.iter_mut().enumerate() {
-            *v = read(&mono, start + k as isize);
-        }
-        let spec = fft.forward_windowed(&buf, &win);
-        let (mut tot, mut hf, mut low, mut cen, mut lsum) = (0f64, 0f64, 0f64, 0f64, 0f64);
-        for k in 0..bins {
-            let p = spec[k].norm_sqr() as f64;
-            mag[k] = p.sqrt() as f32;
-            pw[k] = p;
-            if k >= k_low {
-                tot += p;
-                cen += p * k as f64 * bin_hz;
+        for j in range {
+            let c = (j * hop + hop / 2) as isize;
+            // RMS
+            let a = (c - rms_len as isize / 2).clamp(0, n as isize) as usize;
+            let b = (c + rms_len as isize / 2).clamp(0, n as isize) as usize;
+            let e = if b > a {
+                (pre[b] - pre[a]) / rms_len as f64
+            } else {
+                0.0
+            };
+            fr.log_rms.push((10.0 * (e + EPS).log10()) as f32);
+            // ZCR
+            let mut zc = 0;
+            for i in a.max(1)..b {
+                if (mono[i] >= 0.0) != (mono[i - 1] >= 0.0) {
+                    zc += 1;
+                }
             }
-            if k >= k_hf {
-                hf += p;
+            fr.zcr.push(if b > a {
+                zc as f32 / (b - a) as f32
+            } else {
+                0.0
+            });
+            // Spectrum
+            spectrum(j, &mut fft, &mut buf, &mut pw, &mut mag);
+            let (mut tot, mut hf, mut low, mut cen, mut lsum) = (0f64, 0f64, 0f64, 0f64, 0f64);
+            for (k, &p) in pw.iter().enumerate() {
+                if k >= k_low {
+                    tot += p;
+                    cen += p * k as f64 * bin_hz;
+                }
+                if k >= k_hf {
+                    hf += p;
+                }
+                if k < k_lowband {
+                    low += p;
+                }
+                lsum += p;
             }
-            if k < k_lowband {
-                low += p;
+            fr.hf_ratio.push((hf / (tot + EPS)) as f32);
+            fr.flatness
+                .push(local_flatness(&pw[k_hf..], flat_band) as f32);
+            fr.centroid.push((cen / (tot + EPS)) as f32);
+            fr.low_frac.push((low / (lsum + EPS)) as f32);
+            let upper: f64 = pw[k_lowband..].iter().sum();
+            fr.hf_ratio_upper.push((hf / (upper + EPS)) as f32);
+            let (mut up, mut msum) = (0f64, 0f64);
+            for k in 0..bins {
+                up += (mag[k] - prev_mag[k]).max(0.0) as f64;
+                msum += (mag[k] + prev_mag[k]) as f64;
             }
-            lsum += p;
+            let flux = if msum > 1e-12 {
+                (up / msum) as f32 * 2.0
+            } else {
+                0.0
+            };
+            fr.flux.push(flux.min(1.0));
+            std::mem::swap(&mut prev_mag, &mut mag);
         }
-        hf_ratio[j] = (hf / (tot + EPS)) as f32;
-        flatness[j] = local_flatness(&pw[k_hf..], flat_band) as f32;
-        centroid[j] = (cen / (tot + EPS)) as f32;
-        low_frac[j] = (low / (lsum + EPS)) as f32;
-        let upper: f64 = pw[k_lowband..].iter().sum();
-        hf_ratio_upper[j] = (hf / (upper + EPS)) as f32;
-        let (mut up, mut msum) = (0f64, 0f64);
-        for k in 0..bins {
-            up += (mag[k] - prev_mag[k]).max(0.0) as f64;
-            msum += (mag[k] + prev_mag[k]) as f64;
-        }
-        flux[j] = if msum > 1e-12 {
-            (up / msum) as f32 * 2.0
-        } else {
-            0.0
-        };
-        flux[j] = flux[j].min(1.0);
-        std::mem::swap(&mut prev_mag, &mut mag);
-    }
+        fr
+    });
+    let FrameFeatures {
+        log_rms,
+        flux,
+        hf_ratio,
+        flatness,
+        centroid,
+        zcr,
+        low_frac,
+        hf_ratio_upper,
+    } = FrameFeatures::concat(chunks);
 
     let noise_floor_db = percentile(&log_rms, 0.10);
     let speech_level_db = percentile(&log_rms, 0.95);
@@ -376,7 +399,8 @@ pub fn analyze(channels: &[&[f32]], fs: u32, cfg: &FeatureConfig) -> Features {
     .max(-120.0);
 
     let silent: Vec<bool> = log_rms.iter().map(|&v| v < silence_thr_db).collect();
-    let (periodicity, periodicity_low, f0_hz) = periodicity_track(&mono, fs, hop, nf, cfg, &silent);
+    let (periodicity, periodicity_low, f0_hz) =
+        periodicity_track(&mono, fs, hop, nf, cfg, &silent, threads);
 
     // 1-ms pre-emphasised envelope.
     let fine_block = ms_to_samples(cfg.fine_block_ms, fs);
@@ -421,6 +445,51 @@ pub fn analyze(channels: &[&[f32]], fs: u32, cfg: &FeatureConfig) -> Features {
     }
 }
 
+/// Per-frame spectral and level features of one chunk of frames.
+#[derive(Default)]
+struct FrameFeatures {
+    log_rms: Vec<f32>,
+    flux: Vec<f32>,
+    hf_ratio: Vec<f32>,
+    flatness: Vec<f32>,
+    centroid: Vec<f32>,
+    zcr: Vec<f32>,
+    low_frac: Vec<f32>,
+    hf_ratio_upper: Vec<f32>,
+}
+
+impl FrameFeatures {
+    fn with_capacity(n: usize) -> Self {
+        let v = || Vec::with_capacity(n);
+        Self {
+            log_rms: v(),
+            flux: v(),
+            hf_ratio: v(),
+            flatness: v(),
+            centroid: v(),
+            zcr: v(),
+            low_frac: v(),
+            hf_ratio_upper: v(),
+        }
+    }
+
+    /// Joins chunks in order.
+    fn concat(parts: Vec<Self>) -> Self {
+        let mut all = Self::default();
+        for p in parts {
+            all.log_rms.extend(p.log_rms);
+            all.flux.extend(p.flux);
+            all.hf_ratio.extend(p.hf_ratio);
+            all.flatness.extend(p.flatness);
+            all.centroid.extend(p.centroid);
+            all.zcr.extend(p.zcr);
+            all.low_frac.extend(p.low_frac);
+            all.hf_ratio_upper.extend(p.hf_ratio_upper);
+        }
+        all
+    }
+}
+
 /// Energy-weighted mean of the spectral flatness measured in consecutive sub-bands of
 /// `band` bins. A Gaussian-noise periodogram scores ≈ e^-γ ≈ 0.56 in every band regardless
 /// of the overall spectral shape; harmonic spectra score much lower.
@@ -450,20 +519,27 @@ fn periodicity_track(
     nf: usize,
     cfg: &FeatureConfig,
     silent: &[bool],
+    threads: usize,
 ) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
-    let mut est = PitchEstimator::new(fs, cfg);
-    let mut per = vec![0f32; nf];
-    let mut per_low = vec![0f32; nf];
-    let mut f0 = vec![0f32; nf];
-    for j in 0..nf {
-        if silent[j] {
-            continue;
-        }
-        let c = j * hop + hop / 2;
-        let (p, f, pl) = est.estimate(x, c);
-        per[j] = p;
-        f0[j] = if p > 0.45 { f } else { 0.0 };
-        per_low[j] = pl;
+    let chunks = crate::par::chunks(nf, threads, 64, |range| {
+        let mut est = PitchEstimator::new(fs, cfg);
+        range
+            .map(|j| {
+                if silent[j] {
+                    return (0.0, 0.0, 0.0);
+                }
+                let (p, f, pl) = est.estimate(x, j * hop + hop / 2);
+                (p, if p > 0.45 { f } else { 0.0 }, pl)
+            })
+            .collect::<Vec<_>>()
+    });
+    let mut per = Vec::with_capacity(nf);
+    let mut f0 = Vec::with_capacity(nf);
+    let mut per_low = Vec::with_capacity(nf);
+    for (p, f, pl) in chunks.into_iter().flatten() {
+        per.push(p);
+        f0.push(f);
+        per_low.push(pl);
     }
     (per, per_low, f0)
 }

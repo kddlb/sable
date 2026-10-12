@@ -80,6 +80,123 @@ pub fn reflect(i: i64, n: usize) -> usize {
     m as usize
 }
 
+/// A signal extended by mirror reflection on both sides, so reads near the edges are
+/// plain slices. Equivalent to indexing through [`reflect`] within `pad` of the ends.
+struct Padded {
+    data: Vec<f32>,
+    pad: usize,
+}
+
+impl Padded {
+    fn new(x: &[f32], pad: usize) -> Self {
+        let n = x.len() as i64;
+        let data = (-(pad as i64)..n + pad as i64)
+            .map(|i| x[reflect(i, x.len())])
+            .collect();
+        Self { data, pad }
+    }
+
+    /// `len` samples starting at signal index `start`, or `None` beyond the padding.
+    #[inline]
+    fn slice(&self, start: i64, len: usize) -> Option<&[f32]> {
+        let a = usize::try_from(start + self.pad as i64).ok()?;
+        self.data.get(a..a.checked_add(len)?)
+    }
+}
+
+/// Signal samples `start..start + len`, mirror-reflected at the edges.
+fn read<'a>(p: &'a Padded, x: &[f32], start: i64, len: usize, tmp: &'a mut Vec<f32>) -> &'a [f32] {
+    match p.slice(start, len) {
+        Some(s) => s,
+        None => {
+            tmp.clear();
+            tmp.extend((0..len as i64).map(|i| x[reflect(start + i, x.len())]));
+            tmp
+        }
+    }
+}
+
+/// True if any onset in the sorted `onsets` lies in `[lo, hi)`.
+#[inline]
+fn any_in(onsets: &[i64], lo: i64, hi: i64) -> bool {
+    let k = onsets.partition_point(|&s| s < lo);
+    k < onsets.len() && onsets[k] < hi
+}
+
+/// Normalized cross-correlation of `tmpl` with the source at each candidate centre in
+/// `cands` (template index 0 at source `c + off`), every `step`-th sample, into `out`.
+///
+/// `LANES` candidates share one pass so their accumulations run as independent chains;
+/// each candidate's own summation order is unchanged, so the scores are bit-identical
+/// to scoring the candidates one at a time.
+#[allow(clippy::too_many_arguments)]
+fn ncc_scores(
+    p: &Padded,
+    x: &[f32],
+    tmpl: &[f64],
+    off: i64,
+    cands: &[i64],
+    step: usize,
+    et: f64,
+    out: &mut Vec<f64>,
+) {
+    let n = tmpl.len();
+    out.clear();
+    let finish = |num: f64, ec: f64| {
+        if ec <= 1e-30 || et <= 1e-30 {
+            -1.0
+        } else {
+            num / (ec * et).sqrt()
+        }
+    };
+    const LANES: usize = 8;
+    let mut owned: [Vec<f32>; LANES] = Default::default();
+    for block in cands.chunks(LANES) {
+        for (k, &c) in block.iter().enumerate() {
+            if p.slice(c + off, n).is_none() {
+                owned[k] = (0..n as i64)
+                    .map(|i| x[reflect(c + off + i, x.len())])
+                    .collect();
+            }
+        }
+        let src = |k: usize| -> &[f32] {
+            match p.slice(block[k] + off, n) {
+                Some(s) => s,
+                None => &owned[k][..n],
+            }
+        };
+        if block.len() == LANES {
+            let srcs: [&[f32]; LANES] = std::array::from_fn(|k| &src(k)[..n]);
+            let mut num = [0f64; LANES];
+            let mut ec = [0f64; LANES];
+            let mut i = 0;
+            while i < n {
+                let t = tmpl[i];
+                for k in 0..LANES {
+                    let v = srcs[k][i] as f64;
+                    num[k] += v * t;
+                    ec[k] += v * v;
+                }
+                i += step;
+            }
+            out.extend((0..LANES).map(|k| finish(num[k], ec[k])));
+        } else {
+            for k in 0..block.len() {
+                let s = &src(k)[..n];
+                let (mut num, mut ec) = (0f64, 0f64);
+                let mut i = 0;
+                while i < n {
+                    let v = s[i] as f64;
+                    num += v * tmpl[i];
+                    ec += v * v;
+                    i += step;
+                }
+                out.push(finish(num, ec));
+            }
+        }
+    }
+}
+
 struct Grain {
     y: i64,
     n: usize,
@@ -144,6 +261,19 @@ pub fn render(
     }
     let mean_sq = mono.iter().map(|&v| (v as f64) * (v as f64)).sum::<f64>() / n_in as f64;
     let grains = schedule(map.n_out, cfg, anchors);
+    // Reads reach at most `search + n/2` beyond the source range; the margin covers that,
+    // and anything further falls back to `reflect`.
+    let reach = grains
+        .iter()
+        .map(|g| g.search + g.n / 2 + 2)
+        .max()
+        .unwrap_or(0);
+    let mono_p = Padded::new(mono, reach);
+    let chans_p: Vec<Padded> = channels.iter().map(|c| Padded::new(c, reach)).collect();
+    let mut tmp_b = Vec::new();
+    let (mut cands, mut scores): (Vec<i64>, Vec<f64>) = (Vec::new(), Vec::new());
+    let mut onsets: Vec<i64> = anchors.iter().map(|a| a.in_onset as i64).collect();
+    onsets.sort_unstable();
     let mut windows: Vec<(usize, Vec<f32>)> = Vec::new();
     let mut prev_c: Option<i64> = None;
     let mut covered_to: i64 = i64::MIN;
@@ -171,16 +301,8 @@ pub fn render(
             }
         }
         let t_energy: f64 = tmpl.iter().map(|v| v * v).sum();
-        let anchored = anchors.iter().any(|a| {
-            let s = a.in_onset as i64;
-            s >= pred - half && s < pred + half
-        });
-        let crosses = |c: i64| {
-            anchors.iter().any(|a| {
-                let s = a.in_onset as i64;
-                s >= c - half && s < c + half
-            })
-        };
+        let anchored = any_in(&onsets, pred - half, pred + half);
+        let crosses = |c: i64| any_in(&onsets, c - half, c + half);
         // Prefer forward progression: never step back by more than one synthesis hop.
         // (Expansion legitimately re-uses a pitch period, which needs a short step back.)
         let lo_bound = prev_c.map_or(i64::MIN, |p| p - g.hop as i64 + 1);
@@ -192,35 +314,42 @@ pub fn render(
                 pred
             } else {
                 let off = ov_a - g.y; // template index 0 corresponds to source c + off
-                let score = |c: i64, step: usize| -> f64 {
-                    let (mut num, mut ec, mut et) = (0f64, 0f64, 0f64);
+                // Template energy at a given decimation does not depend on the candidate.
+                let tmpl_energy = |step: usize| -> f64 {
+                    let mut et = 0f64;
                     let mut i = 0;
                     while i < tmpl.len() {
-                        let x = mono[reflect(c + off + i as i64, n_in)] as f64;
-                        let t = tmpl[i];
-                        num += x * t;
-                        ec += x * x;
-                        et += t * t;
+                        et += tmpl[i] * tmpl[i];
                         i += step;
                     }
-                    if ec <= 1e-30 || et <= 1e-30 {
-                        return -1.0;
-                    }
-                    num / (ec * et).sqrt()
+                    et
                 };
+                let et_by_step = [tmpl_energy(cfg.coarse_step.max(1)), tmpl_energy(1)];
                 let ok = |c: i64| c >= lo_bound && !crosses(c);
                 let step = cfg.coarse_step.max(1) as i64;
+                cands.clear();
+                cands.extend(
+                    (-r..=r)
+                        .step_by(step as usize)
+                        .map(|d| pred + d)
+                        .filter(|&c| ok(c)),
+                );
+                ncc_scores(
+                    &mono_p,
+                    mono,
+                    &tmpl,
+                    off,
+                    &cands,
+                    step as usize,
+                    et_by_step[0],
+                    &mut scores,
+                );
+                // First maximum in scan order (as a sequential scan would pick).
                 let mut best: Option<(f64, i64)> = None;
-                let mut d = -r;
-                while d <= r {
-                    let c = pred + d;
-                    if ok(c) {
-                        let s = score(c, step as usize);
-                        if best.is_none_or(|(b, _)| s > b) {
-                            best = Some((s, c));
-                        }
+                for (&c, &s) in cands.iter().zip(&scores) {
+                    if best.is_none_or(|(b, _)| s > b) {
+                        best = Some((s, c));
                     }
-                    d += step;
                 }
                 match best {
                     None => {
@@ -228,13 +357,25 @@ pub fn render(
                         pred
                     }
                     Some((_, coarse)) => {
+                        cands.clear();
+                        cands.extend(
+                            ((coarse - step + 1)..=(coarse + step - 1))
+                                .filter(|&c| (c - pred).abs() <= r && ok(c)),
+                        );
+                        ncc_scores(
+                            &mono_p,
+                            mono,
+                            &tmpl,
+                            off,
+                            &cands,
+                            1,
+                            et_by_step[1],
+                            &mut scores,
+                        );
                         let mut best = (f64::NEG_INFINITY, coarse);
-                        for c in (coarse - step + 1)..=(coarse + step - 1) {
-                            if (c - pred).abs() <= r && ok(c) {
-                                let s = score(c, 1);
-                                if s > best.0 {
-                                    best = (s, c);
-                                }
+                        for (&c, &s) in cands.iter().zip(&scores) {
+                            if s > best.0 {
+                                best = (s, c);
                             }
                         }
                         best.1
@@ -247,27 +388,38 @@ pub fn render(
         if g.transient {
             stats.transient_grains += 1;
         }
-        let win = match windows.iter().find(|(n, _)| *n == g.n) {
-            Some((_, w)) => w.clone(),
+        let wi = match windows.iter().position(|(n, _)| *n == g.n) {
+            Some(k) => k,
             None => {
-                let w = hann_offset(g.n);
-                windows.push((g.n, w.clone()));
-                w
+                windows.push((g.n, hann_offset(g.n)));
+                windows.len() - 1
             }
         };
-        for (i, &w) in win.iter().enumerate() {
-            let yy = start_out + i as i64;
-            if yy < 0 || yy >= n_out as i64 {
-                continue;
+        let win = &windows[wi].1;
+        // Output range of this grain inside [0, n_out).
+        let i0 = (-start_out).max(0) as usize;
+        let i1 = (n_out as i64 - start_out).clamp(0, g.n as i64) as usize;
+        if i0 < i1 {
+            let y0 = (start_out + i0 as i64) as usize;
+            let s0 = c - half + i0 as i64;
+            let len = i1 - i0;
+            let w = &win[i0..i1];
+            for (ch, cp) in chans_p.iter().enumerate() {
+                let src = read(cp, channels[ch], s0, len, &mut tmp_b);
+                for ((a, &w), &x) in acc[ch][y0..y0 + len].iter_mut().zip(w).zip(src) {
+                    *a += w as f64 * x as f64;
+                }
             }
-            let src = reflect(c - half + i as i64, n_in);
-            let w = w as f64;
-            let yy = yy as usize;
-            for ch in 0..nch {
-                acc[ch][yy] += w * channels[ch][src] as f64;
+            let src = read(&mono_p, mono, s0, len, &mut tmp_b);
+            for (((a, ws), &w), &x) in acc_m[y0..y0 + len]
+                .iter_mut()
+                .zip(&mut wsum[y0..y0 + len])
+                .zip(w)
+                .zip(src)
+            {
+                *a += w as f64 * x as f64;
+                *ws += w as f64;
             }
-            acc_m[yy] += w * mono[src] as f64;
-            wsum[yy] += w;
         }
         covered_to = covered_to.max(g.y + half);
     }

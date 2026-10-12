@@ -67,3 +67,43 @@ fn layers_are_consistent_and_exact_length() {
         "no resynthesized sibilant interior"
     );
 }
+
+#[test]
+fn thread_count_does_not_change_output_or_report() {
+    // A longer utterance so every parallel stage actually splits its work.
+    let fx = synth::utterance_fixture(48_000, 7);
+    let stereo = synth::stereo_s_fixture(48_000, StereoLayout::PartiallyDecorrelated, 4);
+    for audio in [fx.audio, stereo.audio] {
+        let refs = audio.view_refs();
+        let view = AudioView {
+            sample_rate: audio.sample_rate,
+            channels: &refs,
+        };
+        for (f, pitch) in [("0.7", 0.0), ("1.5", 0.0), ("1.25", 3.0)] {
+            let r = StretchRatio::parse(f).unwrap();
+            let run = |threads| {
+                let opts = Options {
+                    diagnostics: true,
+                    pitch_semitones: pitch,
+                    threads,
+                    ..Options::default()
+                };
+                stretch(&view, r, &opts).unwrap()
+            };
+            let one = run(1);
+            for t in [2, 3, 8] {
+                let many = run(t);
+                for (x, y) in one.audio.channels.iter().zip(&many.audio.channels) {
+                    assert!(
+                        x.iter().zip(y).all(|(p, q)| p.to_bits() == q.to_bits()),
+                        "{f} pitch {pitch}: {t} threads differ from 1"
+                    );
+                }
+                assert_eq!(
+                    serde_json::to_string(&one.report).unwrap(),
+                    serde_json::to_string(&many.report).unwrap()
+                );
+            }
+        }
+    }
+}

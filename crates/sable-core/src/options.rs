@@ -60,6 +60,10 @@ pub struct Options {
     pub pitch_semitones: f64,
     /// Envelope handling for a nonzero `pitch_semitones`.
     pub formants: FormantMode,
+    /// Worker threads for the parallel stages (`0` = all cores, `1` = calling thread
+    /// only). The output is bit-identical for every setting.
+    #[serde(skip)]
+    pub threads: usize,
 }
 
 impl Default for Options {
@@ -77,6 +81,7 @@ impl Default for Options {
             side_duck_db: -6.0,
             pitch_semitones: 0.0,
             formants: FormantMode::Preserve,
+            threads: 0,
         }
     }
 }
