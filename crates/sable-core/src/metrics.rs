@@ -157,3 +157,54 @@ pub fn max_autocorr(x: &[f32], a: usize, b: usize, min_lag: usize, max_lag: usiz
     }
     best
 }
+
+/// Pre-emphasised RMS envelope over ~1 ms.
+pub fn transient_env(x: &[f32], fs: u32) -> Vec<f64> {
+    let w = (fs as usize / 1000).max(1);
+    let d: Vec<f64> = (0..x.len())
+        .map(|i| (x[i] as f64 - if i > 0 { 0.97 * x[i - 1] as f64 } else { 0.0 }).powi(2))
+        .collect();
+    (0..d.len())
+        .map(|i| {
+            let a = i.saturating_sub(w / 2);
+            let b = (i + w / 2 + 1).min(d.len());
+            (d[a..b].iter().sum::<f64>() / (b - a) as f64).sqrt()
+        })
+        .collect()
+}
+
+/// Number of envelope peaks >= `frac` of the main peak within ±`radius` of `center`,
+/// counting peaks separated by at least `sep` frames.
+pub fn release_peaks(
+    env: &[f64],
+    center: usize,
+    radius: usize,
+    sep: usize,
+    frac: f64,
+) -> (usize, usize) {
+    let a = center.saturating_sub(radius);
+    let b = (center + radius).min(env.len());
+    let (mut main_i, mut main_v) = (a, 0.0);
+    for (i, &v) in env.iter().enumerate().take(b).skip(a) {
+        if v > main_v {
+            main_v = v;
+            main_i = i;
+        }
+    }
+    let mut count = 0;
+    let mut i = a;
+    while i < b {
+        if env[i] >= frac * main_v {
+            count += 1;
+            // Skip this peak region.
+            let mut j = i;
+            while j < b && (env[j] >= 0.25 * main_v || j < i + sep) {
+                j += 1;
+            }
+            i = j;
+        } else {
+            i += 1;
+        }
+    }
+    (count, main_i)
+}
