@@ -5,7 +5,7 @@ use crate::budget::{self, AllocError, Stage};
 use crate::detect::{EventDetector, HeuristicDetector};
 use crate::error::StretchError;
 use crate::features::{self, FeatureConfig, Features};
-use crate::options::Options;
+use crate::options::{Options, StereoMode};
 use crate::ratio::StretchRatio;
 use crate::report::{AnalysisReport, FeatureDump, RenderPath, SegmentReport, Warning};
 use crate::segments::{EventKind, Segment, coalesce_to_count, renumber, validate_partition};
@@ -187,6 +187,15 @@ fn plan(
     )
 }
 
+/// `[M, S]` → `[M + S, M − S]`.
+fn ms_to_lr(mut ms: Vec<Vec<f32>>) -> Vec<Vec<f32>> {
+    let s = ms.pop().expect("side channel");
+    let m = ms.pop().expect("mid channel");
+    let l = m.iter().zip(&s).map(|(a, b)| a + b).collect();
+    let r = m.iter().zip(&s).map(|(a, b)| a - b).collect();
+    vec![l, r]
+}
+
 /// Full rendering path. Returns exactly `n_out` frames per channel.
 pub fn render(
     input: &AudioView<'_>,
@@ -231,6 +240,43 @@ pub fn render(
         RenderPath::Uniform
     };
 
+    // Working channels: L/R, or M/S in mid/side mode. WSOLA overlap-add is linear and
+    // the grain positions are chosen once on the mono reference, so the M/S baseline
+    // recombines to exactly the L/R baseline; only the special renderers differ.
+    let mid_side = opts.stereo_mode == StereoMode::MidSide && input.channels.len() == 2;
+    let ms_src: Vec<Vec<f32>> = if mid_side {
+        let (l, rr) = (input.channels[0], input.channels[1]);
+        vec![
+            l.iter().zip(rr).map(|(a, b)| 0.5 * (a + b)).collect(),
+            l.iter().zip(rr).map(|(a, b)| 0.5 * (a - b)).collect(),
+        ]
+    } else {
+        Vec::new()
+    };
+    let ms_refs: Vec<&[f32]> = ms_src.iter().map(Vec::as_slice).collect();
+    let work = if mid_side {
+        AudioView {
+            sample_rate: fs,
+            channels: &ms_refs,
+        }
+    } else {
+        *input
+    };
+    // Special renderers see only the mid in mid/side mode.
+    let special = if mid_side {
+        AudioView {
+            sample_rate: fs,
+            channels: &ms_refs[..1],
+        }
+    } else {
+        *input
+    };
+    let n_special = special.channels.len();
+    if mid_side {
+        report.stereo_mode = StereoMode::MidSide;
+        report.side_duck_db = Some(opts.side_duck_db.min(0.0));
+    }
+
     // Baseline WSOLA.
     let anchors: Vec<Anchor> = plan
         .anchored
@@ -242,7 +288,7 @@ pub fn render(
         })
         .collect();
     let cfg = WsolaConfig::new(fs, opts.quality);
-    let base = wsola::render(input.channels, &feats.mono, &plan.map, &anchors, &cfg);
+    let base = wsola::render(work.channels, &feats.mono, &plan.map, &anchors, &cfg);
     if base.stats.uncovered_filled > 0 {
         report.warnings.push(Warning::UncoveredSamplesFilled {
             count: base.stats.uncovered_filled,
@@ -253,11 +299,35 @@ pub fn render(
 
     // Plosive overlays at fixed coordinates.
     let mut out = baseline.clone();
-    let plos = plosives::apply(input, &plan, opts, &mut out, report);
+    let plos = plosives::apply(&special, &plan, opts, &mut out[..n_special], report);
     let after_plosive = opts.keep_layers.then(|| out.clone());
 
     // Sibilant overlays at fixed coordinates.
-    let sib = sibilants::apply(input, &feats, &plan, opts, &plos.mask, &mut out, report);
+    let sib = sibilants::apply(
+        &special,
+        &feats,
+        &plan,
+        opts,
+        &plos.mask,
+        &mut out[..n_special],
+        report,
+    );
+
+    // Mid/side: duck the side where the mid is specially rendered, then recombine.
+    let (out, baseline, after_plosive) = if mid_side {
+        let duck = 10f64.powf(opts.side_duck_db.min(0.0) / 20.0) as f32;
+        for (t, s) in out[1].iter_mut().enumerate() {
+            let m = plos.mask[t].max(sib.mask[t]).clamp(0.0, 1.0);
+            *s *= 1.0 - m * (1.0 - duck);
+        }
+        (
+            ms_to_lr(out),
+            ms_to_lr(baseline),
+            after_plosive.map(ms_to_lr),
+        )
+    } else {
+        (out, baseline, after_plosive)
+    };
 
     // Segment table.
     let mut o = 0u64;

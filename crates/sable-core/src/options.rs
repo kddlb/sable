@@ -2,6 +2,18 @@
 
 use serde::Serialize;
 
+/// How stereo input is rendered.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub enum StereoMode {
+    /// Both channels get every renderer; sibilant noise uses the stereo covariance model.
+    #[default]
+    LeftRight,
+    /// Mid = (L+R)/2 gets the full SABLE treatment; Side = (L−R)/2 is WSOLA only (same
+    /// time map and grain positions as the mid) and is ducked by `side_duck_db` inside
+    /// the mid's special events. Output is recombined to L = M+S, R = M−S.
+    MidSide,
+}
+
 /// Trades CPU time for search breadth and analysis resolution.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 pub enum QualityPreset {
@@ -28,6 +40,11 @@ pub struct Options {
     pub keep_layers: bool,
     /// Skip event detection and use one uniform time map (generic WSOLA baseline).
     pub uniform_timing: bool,
+    /// Stereo rendering strategy (ignored for mono).
+    pub stereo_mode: StereoMode,
+    /// Side-channel gain (dB, <= 0) inside resynthesized sibilants and protected burst
+    /// cores in [`StereoMode::MidSide`]; follows the renderer masks smoothly.
+    pub side_duck_db: f64,
 }
 
 impl Default for Options {
@@ -41,6 +58,8 @@ impl Default for Options {
             enable_sibilant: true,
             keep_layers: false,
             uniform_timing: false,
+            stereo_mode: StereoMode::LeftRight,
+            side_duck_db: -6.0,
         }
     }
 }

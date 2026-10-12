@@ -20,6 +20,7 @@ use eframe::egui::{self, Color32, RichText};
 use sable_cli::trim::{SilenceTrim, leading_silence_frames, skip_frames};
 use sable_cli::wav::{Format, write_wav};
 use sable_cli::{may_have_encoder_padding, read_audio, supported_extensions};
+use sable_core::StereoMode;
 use sable_core::detect::BurstCandidate;
 use sable_core::segments::{EventKind, Segment};
 use sable_core::{
@@ -73,6 +74,8 @@ struct Settings {
     generic: bool,
     skip_silence: bool,
     silence_db: f64,
+    mid_side: bool,
+    side_duck_db: f64,
 }
 
 impl Settings {
@@ -87,6 +90,10 @@ impl Settings {
         o.enable_plosive &= self.plosive;
         o.enable_sibilant &= self.sibilant;
         o.keep_layers = true;
+        if self.mid_side {
+            o.stereo_mode = StereoMode::MidSide;
+        }
+        o.side_duck_db = self.side_duck_db.min(0.0);
         o
     }
 }
@@ -163,6 +170,8 @@ impl App {
                 generic: false,
                 skip_silence: false,
                 silence_db: SilenceTrim::default().threshold_db,
+                mid_side: false,
+                side_duck_db: Options::default().side_duck_db,
             },
             format: Format::Float32,
             analyze_rx: None,
@@ -186,6 +195,8 @@ impl App {
                 generic: false,
                 skip_silence: false,
                 silence_db: 0.0,
+                mid_side: false,
+                side_duck_db: 0.0,
             },
             changed_at: None,
             failed_settings: None,
@@ -587,6 +598,35 @@ impl App {
             ui.add_enabled_ui(!self.settings.generic, |ui| {
                 ui.checkbox(&mut self.settings.plosive, "Protect plosive bursts");
                 ui.checkbox(&mut self.settings.sibilant, "Resynthesize sibilants");
+            });
+            let stereo = self.input.as_ref().is_some_and(|i| i.audio.channels.len() == 2);
+            ui.add_enabled_ui(stereo, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Stereo");
+                    egui::ComboBox::from_id_salt("stereo")
+                        .selected_text(if self.settings.mid_side { "Mid/Side" } else { "Left/Right" })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut self.settings.mid_side, false, "Left/Right")
+                                .on_hover_text("Every renderer on both channels; stereo noise model.");
+                            ui.selectable_value(&mut self.settings.mid_side, true, "Mid/Side")
+                                .on_hover_text(
+                                    "Mid gets SABLE; side gets WSOLA on the same time map, \
+                                     ducked inside mid events. Off-centre voices lose their \
+                                     position during resynthesized sibilants.",
+                                );
+                        });
+                });
+                ui.add_enabled_ui(self.settings.mid_side, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("Side duck");
+                        ui.add(
+                            egui::DragValue::new(&mut self.settings.side_duck_db)
+                                .range(-40.0..=0.0)
+                                .speed(0.25)
+                                .suffix(" dB"),
+                        );
+                    });
+                });
             });
             ui.checkbox(&mut self.settings.skip_silence, "Skip leading silence")
                 .on_hover_text(

@@ -80,6 +80,55 @@ pub struct SpectralTemplate {
     pub c: Option<Vec<Vec<(f64, f64)>>>,
     /// Power-weighted mean deviation of |ρ| over time (0 = perfectly stable).
     pub coherence_instability: f64,
+    /// Estimated inter-channel lag in samples (R relative to L), compensated before the
+    /// cross-spectrum is smoothed in frequency.
+    pub interchannel_lag: f64,
+}
+
+/// GCC-PHAT lag (samples, R relative to L) from per-frame cross-spectra `X_R conj X_L`,
+/// searched within ±`max_lag` with parabolic refinement.
+fn gcc_phat_lag(frames: &[Vec<C2>], n_fft: usize, max_lag: usize) -> f64 {
+    let bins = n_fft / 2 + 1;
+    let mut g = vec![Complex::new(0.0, 0.0); bins];
+    for fr in frames {
+        for k in 1..bins - 1 {
+            let (re, im) = (fr[k].0, fr[k].1);
+            let m = (re * re + im * im).sqrt();
+            if m > 1e-30 {
+                g[k].re += (re / m) as f32;
+                g[k].im += (im / m) as f32;
+            }
+        }
+    }
+    let mut fft = RealFft::new(n_fft);
+    let r = fft.inverse(&g).to_vec();
+    let at = |d: i64| r[d.rem_euclid(n_fft as i64) as usize] as f64;
+    let max = max_lag.min(n_fft / 2 - 1) as i64;
+    let mut best = 0i64;
+    for d in -max..=max {
+        if at(d) > at(best) {
+            best = d;
+        }
+    }
+    let (a, b, c) = (at(best - 1), at(best), at(best + 1));
+    let den = a - 2.0 * b + c;
+    let frac = if den.abs() > 1e-12 {
+        (0.5 * (a - c) / den).clamp(-0.5, 0.5)
+    } else {
+        0.0
+    };
+    best as f64 + frac
+}
+
+/// Multiplies every bin of every frame by `e^{j·sign·2πkτ/N}`.
+fn rotate(frames: &mut [Vec<C2>], n_fft: usize, lag: f64, sign: f64) {
+    for fr in frames {
+        for (k, z) in fr.iter_mut().enumerate() {
+            let ph = sign * std::f64::consts::TAU * k as f64 * lag / n_fft as f64;
+            let (s, c) = ph.sin_cos();
+            *z = C2(z.0 * c - z.1 * s, z.0 * s + z.1 * c);
+        }
+    }
 }
 
 /// Frequency neighbourhood half-widths for fractional-octave smoothing.
@@ -228,14 +277,29 @@ impl SpectralTemplate {
                     .collect()
             })
             .collect();
+        let mut lag = 0.0;
         let (c, instability) = if channels.len() == 2 {
-            let ct = smooth_time(&raw_c, cfg.time_smooth);
-            let c: Vec<Vec<(f64, f64)>> = ct
+            // A delay between channels (spaced microphones) turns the cross-spectrum phase
+            // into a ramp that fractional-octave averaging would cancel. Remove the
+            // dominant lag first, smooth, then restore it.
+            lag = gcc_phat_lag(&raw_c, n_fft, ms_to_samples(2.0, fs));
+            let mut aligned = raw_c.clone();
+            rotate(&mut aligned, n_fft, lag, 1.0);
+            let ct = smooth_time(&aligned, cfg.time_smooth);
+            let mut c: Vec<Vec<C2>> = ct
                 .iter()
                 .map(|fr| {
                     let v: Vec<(f64, f64)> = fr.iter().map(|z| (z.0, z.1)).collect();
                     smooth_freq_cross(&v, &nb)
+                        .into_iter()
+                        .map(|(a, b)| C2(a, b))
+                        .collect()
                 })
+                .collect();
+            rotate(&mut c, n_fft, lag, -1.0);
+            let c: Vec<Vec<(f64, f64)>> = c
+                .into_iter()
+                .map(|fr| fr.into_iter().map(|z| (z.0, z.1)).collect())
                 .collect();
             // Instability: power-weighted mean |ρ_t - mean_t ρ| per bin.
             let mut num = 0.0;
@@ -266,6 +330,7 @@ impl SpectralTemplate {
             p,
             c,
             coherence_instability: instability,
+            interchannel_lag: lag,
         }
     }
 
@@ -611,8 +676,8 @@ pub fn apply(
                     .join("/"),
                 if nch == 2 {
                     format!(
-                        ", coherence instability {:.2}",
-                        template.coherence_instability
+                        ", coherence instability {:.2}, inter-channel lag {:.1} samples",
+                        template.coherence_instability, template.interchannel_lag
                     )
                 } else {
                     String::new()

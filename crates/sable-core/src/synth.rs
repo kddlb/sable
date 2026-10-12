@@ -372,6 +372,8 @@ pub enum StereoLayout {
     Coherent,
     Panned,
     PartiallyDecorrelated,
+    /// Spaced-pair capture: right channel delayed by 0.7 ms and 2 dB quieter.
+    Delayed,
 }
 
 /// Stereo /s/ fixture: the same structure as [`fricative_fixture`] with a spatial layout.
@@ -385,6 +387,13 @@ pub fn stereo_s_fixture(fs: u32, layout: StereoLayout, seed: u64) -> Fixture {
             base.clone(),
             base.iter().map(|v| v * 0.35).collect::<Vec<_>>(),
         ),
+        StereoLayout::Delayed => {
+            let d = ms_to_samples(0.7, fs);
+            let r: Vec<f32> = (0..n)
+                .map(|i| if i >= d { base[i - d] * 0.794 } else { 0.0 })
+                .collect();
+            (base.clone(), r)
+        }
         StereoLayout::PartiallyDecorrelated => {
             let (s0, s1, _) = mono.truth.sibilants[0];
             let ms = |m: f64| ms_to_samples(m, fs);

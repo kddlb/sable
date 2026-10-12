@@ -134,27 +134,42 @@ Max |F0 error| over factors 0.5–2.0 (excluding 1/4).
 
 ### Stereo sibilance (r = 1.5, 32 kHz)
 
-Coherence = mean magnitude-squared coherence, 4–12 kHz.
+Coherence = mean magnitude-squared coherence, 4–12 kHz. *S/M* = side-to-mid energy. L/R = default stereo mode (covariance model); M/S = mid/side mode (mid SABLE, side WSOLA ducked −6 dB inside mid events).
 
-| layout | L/R in | SABLE L/R | generic L/R | coherence in | SABLE coherence | generic coherence |
-|---|---:|---:|---:|---:|---:|---:|
-| Coherent | 0.00 dB | -0.00 dB | 0.00 dB | 1.00 | 1.00 | 1.00 |
-| Panned | 9.12 dB | 9.12 dB | 9.12 dB | 1.00 | 1.00 | 1.00 |
-| PartiallyDecorrelated | 0.15 dB | 0.12 dB | 0.17 dB | 0.43 | 0.44 | 0.44 |
+| layout | L/R in | L/R mode | M/S mode | generic | coh in | coh L/R mode | coh M/S mode | coh generic | S/M in | S/M L/R mode | S/M M/S mode |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| Coherent | 0.00 dB | -0.00 dB | 0.00 dB | 0.00 dB | 1.00 | 1.00 | 1.00 | 1.00 | -315.5 dB | -33.2 dB | -317.5 dB |
+| Panned | 9.12 dB | 9.12 dB | 0.07 dB | 9.12 dB | 1.00 | 1.00 | 0.84 | 1.00 | -6.3 dB | -6.3 dB | -13.1 dB |
+| PartiallyDecorrelated | 0.15 dB | 0.12 dB | 0.14 dB | 0.17 dB | 0.43 | 0.44 | 0.85 | 0.44 | -6.6 dB | -6.8 dB | -13.4 dB |
+| Delayed | 1.99 dB | 2.00 dB | 0.05 dB | 1.98 dB | 0.98 | 0.97 | 0.60 | 0.97 | -0.4 dB | -0.2 dB | -7.9 dB |
 
 ### Local speech recordings (not committed)
 
 | file | ch | r | N_in | N_out | stage | bursts copied | sibilants resynth. (of detected) | time |
 |---|---:|---:|---:|---:|:---:|---:|---:|---:|
-| speech 1 | 1 | 0.65 | 437325 | 284261 | A | 1 | 7 (9) | 153 ms |
-| speech 1 | 1 | 0.75 | 437325 | 327994 | A | 1 | 7 (9) | 170 ms |
-| speech 1 | 1 | 1.25 | 437325 | 546656 | A | 1 | 7 (9) | 271 ms |
+| speech 1 | 1 | 0.65 | 437325 | 284261 | A | 1 | 7 (9) | 156 ms |
+| speech 1 | 1 | 0.75 | 437325 | 327994 | A | 1 | 7 (9) | 169 ms |
+| speech 1 | 1 | 1.25 | 437325 | 546656 | A | 1 | 7 (9) | 241 ms |
 | speech 1 | 1 | 1.5 | 437325 | 655988 | A | 1 | 7 (9) | 271 ms |
-| speech 1 | 1 | 2 | 437325 | 874650 | A | 1 | 7 (9) | 338 ms |
-| speech 2 | 2 | 0.65 | 424603 | 275992 | A | 1 | 6 (6) | 181 ms |
-| speech 2 | 2 | 0.75 | 424603 | 318452 | A | 1 | 6 (6) | 193 ms |
-| speech 2 | 2 | 1.25 | 424603 | 530754 | A | 1 | 6 (6) | 258 ms |
-| speech 2 | 2 | 1.5 | 424603 | 636905 | A | 1 | 6 (6) | 288 ms |
-| speech 2 | 2 | 2 | 424603 | 849206 | A | 1 | 6 (6) | 353 ms |
+| speech 1 | 1 | 2 | 437325 | 874650 | A | 1 | 7 (9) | 351 ms |
+| speech 2 | 2 | 0.65 | 424603 | 275992 | A | 1 | 6 (6) | 182 ms |
+| speech 2 | 2 | 0.75 | 424603 | 318452 | A | 1 | 6 (6) | 196 ms |
+| speech 2 | 2 | 1.25 | 424603 | 530754 | A | 1 | 6 (6) | 262 ms |
+| speech 2 | 2 | 1.5 | 424603 | 636905 | A | 1 | 6 (6) | 295 ms |
+| speech 2 | 2 | 2 | 424603 | 849206 | A | 1 | 6 (6) | 357 ms |
+| speech 3 | 2 | 0.65 | 1104000 | 717600 | A | 0 | 6 (12) | 417 ms |
+| speech 3 | 2 | 0.75 | 1104000 | 828000 | A | 0 | 6 (12) | 469 ms |
+| speech 3 | 2 | 1.25 | 1104000 | 1380000 | A | 0 | 6 (12) | 653 ms |
+| speech 3 | 2 | 1.5 | 1104000 | 1656000 | A | 0 | 6 (12) | 696 ms |
+| speech 3 | 2 | 2 | 1104000 | 2208000 | A | 0 | 6 (12) | 921 ms |
+
+### Stereo recordings: L/R mode vs M/S mode (r = 1.5)
+
+Averages over resynthesized sibilants (interior, 25 ms edges excluded). *Whole S/M* is over the entire file. Coherence 4–12 kHz.
+
+| file | sibilants | coh in | coh L/R | coh M/S | S/M in | S/M L/R | S/M M/S | whole S/M in | whole S/M L/R | whole S/M M/S |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| speech 2 | 6 | 0.94 | 0.85 | 0.71 | -2.7 dB | -2.5 dB | -12.4 dB | 1.5 dB | 1.6 dB | 1.5 dB |
+| speech 3 | 6 | 0.99 | 0.99 | 1.00 | -7.4 dB | -7.5 dB | -14.0 dB | -19.4 dB | -20.1 dB | -20.1 dB |
 
 <!-- END GENERATED -->

@@ -7,9 +7,10 @@ use sable_core::AudioBuffer;
 use sable_core::synth::{self, Fixture, Fricative, StereoLayout};
 
 /// Default locations of the maintainer's own speech recordings (never committed).
-pub const DEFAULT_SPEECH: [&str; 2] = [
+pub const DEFAULT_SPEECH: [&str; 3] = [
     r"speech1.wav",
     r"speech2.wav",
+    r"speech3.wav",
 ];
 
 /// Real speech recordings: `$SABLE_SPEECH_WAV` (`;`-separated) or the defaults that exist.

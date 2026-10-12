@@ -98,3 +98,29 @@ silently concealed. This document lists those trade-offs.
   evidence of perceptual improvement.
 * No metric here establishes perceptual quality. Listening decisions belong in
   QUALITY.md and must be made by a human.
+
+## 8. Stereo: L/R mode vs mid/side mode
+
+* **Inter-channel delay (L/R mode).** Sibilant noise reproduces the measured stereo
+  cross-spectrum. A delay between channels (spaced microphones) turns its phase into a
+  ramp, and 1/6-octave averaging would cancel that ramp. The template therefore estimates
+  the dominant lag per event (GCC-PHAT, ±2 ms), removes it before smoothing, and
+  restores it afterwards. On a recording with a 0.73 ms offset this raised sibilant
+  coherence from 0.65 to 0.85 (input 0.94). Several lags at once (e.g. strong room
+  reflections) are only partly handled.
+* **Mid/side mode (opt-in).** The mid gets every renderer. The side stays WSOLA on the
+  same time map and the same grain positions: overlap-add is linear, so without special
+  events M/S output equals L/R output to rounding (tested). Inside the mid's special
+  events the side is ducked (default −6 dB, following the renderer masks). Measured
+  consequences (QUALITY.md, "Stereo sibilance"):
+  * **Off-centre or delayed sources lose their position during resynthesized
+    sibilants.** Panning lives in the correlation between M and S, and fresh mid noise
+    is uncorrelated with the side, so a 9 dB pan collapses to about 0 dB, and a spaced
+    pair loses its 2 dB balance.
+  * **The duck narrows the image during each /s/** (side-to-mid energy drops by about the
+    duck depth). On a reverberant vocal this ducks the reverb under each /s/. Set
+    `side_duck_db = 0` to keep the width.
+  * For centred, reverberant material the coherence metrics of both modes are
+    equivalent. Whether M/S sounds better (less WSOLA on the voice's own stereo
+    sibilance, side artifacts masked by the duck) is a listening question. The A/B set
+    includes `*_sable_ms.wav` renders for stereo inputs.

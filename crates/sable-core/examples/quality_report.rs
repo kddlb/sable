@@ -285,20 +285,49 @@ fn sibilant_section(md: &mut String) {
     md.push('\n');
 }
 
+fn mid_side() -> Options {
+    Options {
+        stereo_mode: sable_core::StereoMode::MidSide,
+        ..Options::default()
+    }
+}
+
+/// Side-to-mid energy ratio (dB) of `c` over `[a, b)`.
+fn side_mid_db(c: &[Vec<f32>], (a, b): (usize, usize)) -> f64 {
+    let (mut m, mut s) = (0f64, 0f64);
+    for (&l, &r) in c[0][a..b].iter().zip(&c[1][a..b]) {
+        let (l, r) = (l as f64, r as f64);
+        m += (0.5 * (l + r)).powi(2);
+        s += (0.5 * (l - r)).powi(2);
+    }
+    10.0 * ((s + 1e-30) / (m + 1e-30)).log10()
+}
+
 fn stereo_section(md: &mut String) {
     writeln!(md, "### Stereo sibilance (r = 1.5, 32 kHz)\n").unwrap();
     writeln!(
         md,
-        "Coherence = mean magnitude-squared coherence, 4–12 kHz.\n"
+        "Coherence = mean magnitude-squared coherence, 4–12 kHz. *S/M* = side-to-mid energy. \
+         L/R = default stereo mode (covariance model); M/S = mid/side mode (mid SABLE, side \
+         WSOLA ducked −6 dB inside mid events).\n"
     )
     .unwrap();
-    writeln!(md, "| layout | L/R in | SABLE L/R | generic L/R | coherence in | SABLE coherence | generic coherence |").unwrap();
-    writeln!(md, "|---|---:|---:|---:|---:|---:|---:|").unwrap();
+    writeln!(
+        md,
+        "| layout | L/R in | L/R mode | M/S mode | generic | coh in | coh L/R mode | coh M/S mode | coh generic | S/M in | S/M L/R mode | S/M M/S mode |"
+    )
+    .unwrap();
+    writeln!(
+        md,
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"
+    )
+    .unwrap();
     let fs = 32_000;
     for layout in [
         StereoLayout::Coherent,
         StereoLayout::Panned,
         StereoLayout::PartiallyDecorrelated,
+        StereoLayout::Delayed,
     ] {
         let fx = synth::stereo_s_fixture(fs, layout, 6);
         let (ts, te, _) = fx.truth.sibilants[0];
@@ -311,22 +340,136 @@ fn stereo_section(md: &mut String) {
         let coh = |c: &[Vec<f32>], (a, b): (usize, usize)| {
             mean_coherence(&c[0], &c[1], a, b, 512, fs, (4000.0, 12000.0))
         };
+        let region = |p: &ProcessResult| {
+            p.report
+                .sibilant_overlays
+                .iter()
+                .find(|o| o.applied)
+                .map_or((src.0 * 3 / 2, src.1 * 3 / 2), |o| {
+                    (o.out_start as usize + edge, o.out_end as usize - edge)
+                })
+        };
         let s = run(&fx, "1.5", &sable());
-        let ov = s.report.sibilant_overlays.iter().find(|o| o.applied);
-        let so = ov.map_or((src.0 * 3 / 2, src.1 * 3 / 2), |o| {
-            (o.out_start as usize + edge, o.out_end as usize - edge)
-        });
+        let so = region(&s);
+        let m = run(&fx, "1.5", &mid_side());
+        let mo = region(&m);
         let g = run(&fx, "1.5", &generic());
         let go = (src.0 * 3 / 2, src.1 * 3 / 2);
         writeln!(
             md,
-            "| {layout:?} | {:.2} dB | {:.2} dB | {:.2} dB | {:.2} | {:.2} | {:.2} |",
+            "| {layout:?} | {:.2} dB | {:.2} dB | {:.2} dB | {:.2} dB | {:.2} | {:.2} | {:.2} | {:.2} | {:.1} dB | {:.1} dB | {:.1} dB |",
             lr(&fx.audio.channels, src),
             lr(&s.audio.channels, so),
+            lr(&m.audio.channels, mo),
             lr(&g.audio.channels, go),
             coh(&fx.audio.channels, src),
             coh(&s.audio.channels, so),
-            coh(&g.audio.channels, go)
+            coh(&m.audio.channels, mo),
+            coh(&g.audio.channels, go),
+            side_mid_db(&fx.audio.channels, src),
+            side_mid_db(&s.audio.channels, so),
+            side_mid_db(&m.audio.channels, mo),
+        )
+        .unwrap();
+    }
+    md.push('\n');
+}
+
+/// L/R vs M/S on the local stereo recordings, measured over every sibilant that both
+/// modes resynthesized (input region = same segment in the source).
+fn speech_stereo_section(md: &mut String) {
+    let stereo: Vec<_> = common::speech_paths()
+        .into_iter()
+        .enumerate()
+        .filter_map(|(i, p)| {
+            let a = common::read_wav(&p).ok()?;
+            (a.channels.len() == 2).then_some((i + 1, a))
+        })
+        .collect();
+    if stereo.is_empty() {
+        return;
+    }
+    writeln!(
+        md,
+        "### Stereo recordings: L/R mode vs M/S mode (r = 1.5)\n"
+    )
+    .unwrap();
+    writeln!(
+        md,
+        "Averages over resynthesized sibilants (interior, 25 ms edges excluded). *Whole S/M* is \
+         over the entire file. Coherence 4–12 kHz.\n"
+    )
+    .unwrap();
+    writeln!(
+        md,
+        "| file | sibilants | coh in | coh L/R | coh M/S | S/M in | S/M L/R | S/M M/S | whole S/M in | whole S/M L/R | whole S/M M/S |"
+    )
+    .unwrap();
+    writeln!(
+        md,
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"
+    )
+    .unwrap();
+    for (idx, audio) in stereo {
+        let fs = audio.sample_rate;
+        let fx = Fixture {
+            name: format!("speech{idx}"),
+            audio,
+            truth: Default::default(),
+        };
+        let l = run(&fx, "1.5", &sable());
+        let m = run(&fx, "1.5", &mid_side());
+        let edge = fs as usize * 25 / 1000;
+        let (mut n, mut acc) = (0usize, [0f64; 6]);
+        for ov in l.report.sibilant_overlays.iter().filter(|o| o.applied) {
+            let Some(om) = m
+                .report
+                .sibilant_overlays
+                .iter()
+                .find(|o| o.applied && o.out_start == ov.out_start)
+            else {
+                continue;
+            };
+            let seg = l
+                .report
+                .segments
+                .iter()
+                .find(|s| s.id == ov.segment_id)
+                .unwrap();
+            let src = (
+                seg.in_start as usize + edge,
+                (seg.in_start + seg.in_len) as usize - edge,
+            );
+            let out = (ov.out_start as usize + edge, ov.out_end as usize - edge);
+            let outm = (om.out_start as usize + edge, om.out_end as usize - edge);
+            if src.1 <= src.0 + 512 || out.1 <= out.0 + 512 {
+                continue;
+            }
+            let coh = |c: &[Vec<f32>], (a, b): (usize, usize)| {
+                mean_coherence(&c[0], &c[1], a, b, 512, fs, (4000.0, 12000.0))
+            };
+            acc[0] += coh(&fx.audio.channels, src);
+            acc[1] += coh(&l.audio.channels, out);
+            acc[2] += coh(&m.audio.channels, outm);
+            acc[3] += side_mid_db(&fx.audio.channels, src);
+            acc[4] += side_mid_db(&l.audio.channels, out);
+            acc[5] += side_mid_db(&m.audio.channels, outm);
+            n += 1;
+        }
+        let k = n.max(1) as f64;
+        let whole = |c: &[Vec<f32>]| side_mid_db(c, (0, c[0].len()));
+        writeln!(
+            md,
+            "| speech {idx} | {n} | {:.2} | {:.2} | {:.2} | {:.1} dB | {:.1} dB | {:.1} dB | {:.1} dB | {:.1} dB | {:.1} dB |",
+            acc[0] / k,
+            acc[1] / k,
+            acc[2] / k,
+            acc[3] / k,
+            acc[4] / k,
+            acc[5] / k,
+            whole(&fx.audio.channels),
+            whole(&l.audio.channels),
+            whole(&m.audio.channels),
         )
         .unwrap();
     }
@@ -430,6 +573,7 @@ fn main() {
     sibilant_section(&mut md);
     stereo_section(&mut md);
     speech_section(&mut md);
+    speech_stereo_section(&mut md);
     writeln!(md, "<!-- END GENERATED -->").unwrap();
     print!("{md}");
     if write {

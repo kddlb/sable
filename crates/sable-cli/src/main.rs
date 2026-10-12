@@ -9,7 +9,15 @@ use clap::{Parser, ValueEnum};
 use sable_cli::trim::SilenceTrim;
 use sable_cli::wav::{Format, write_wav};
 use sable_cli::{load_input, may_have_encoder_padding, supported_extensions};
-use sable_core::{AudioView, Options, QualityPreset, StretchRatio, stretch};
+use sable_core::{AudioView, Options, QualityPreset, StereoMode, StretchRatio, stretch};
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum Stereo {
+    /// Left/right: every renderer on both channels (default).
+    Lr,
+    /// Mid/side: mid gets SABLE, side gets WSOLA ducked inside mid events.
+    Ms,
+}
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum Quality {
@@ -58,6 +66,12 @@ struct Cli {
     /// Write intermediate layers (baseline, overlays, masks) as WAVs into this directory.
     #[arg(long)]
     dump_dir: Option<PathBuf>,
+    /// Stereo rendering strategy (ignored for mono input).
+    #[arg(long, value_enum, default_value_t = Stereo::Lr)]
+    stereo_mode: Stereo,
+    /// Side gain in dB inside resynthesized sibilants and burst cores (--stereo-mode ms).
+    #[arg(long, default_value_t = Options::default().side_duck_db, allow_negative_numbers = true)]
+    side_duck_db: f64,
     /// Drop leading silence from the input before stretching (keeps a short pre-roll).
     /// The exact output length then applies to the trimmed input.
     #[arg(long)]
@@ -114,6 +128,11 @@ fn run(cli: Cli) -> Result<(), String> {
     opts.enable_plosive &= !cli.no_plosive;
     opts.enable_sibilant &= !cli.no_sibilant;
     opts.keep_layers = cli.dump_dir.is_some();
+    opts.stereo_mode = match cli.stereo_mode {
+        Stereo::Lr => StereoMode::LeftRight,
+        Stereo::Ms => StereoMode::MidSide,
+    };
+    opts.side_duck_db = cli.side_duck_db.min(0.0);
 
     let refs = input.view_refs();
     let view = AudioView {
@@ -133,6 +152,9 @@ fn run(cli: Cli) -> Result<(), String> {
             "skipped        {skipped} leading frames ({:.1} ms of silence)",
             skipped as f64 * 1000.0 / r.sample_rate as f64
         );
+    }
+    if let Some(d) = r.side_duck_db {
+        println!("stereo         mid/side (side duck {d:.1} dB inside mid events)");
     }
     println!("source frames  {}", r.n_in);
     println!("target frames  {}", r.n_out);

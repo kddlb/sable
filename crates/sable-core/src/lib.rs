@@ -43,7 +43,7 @@ pub mod wsola;
 
 pub use audio::{AudioBuffer, AudioView};
 pub use error::StretchError;
-pub use options::{Options, QualityPreset};
+pub use options::{Options, QualityPreset, StereoMode};
 pub use ratio::StretchRatio;
 pub use report::{AnalysisReport, RenderPath, Warning};
 

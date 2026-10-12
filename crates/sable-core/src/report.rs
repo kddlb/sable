@@ -3,6 +3,7 @@
 use serde::Serialize;
 
 use crate::budget::Stage;
+use crate::options::StereoMode;
 use crate::ratio::StretchRatio;
 use crate::segments::{EventKind, SegmentScores};
 
@@ -116,6 +117,10 @@ pub struct AnalysisReport {
     pub achieved_factor: f64,
     pub path: RenderPath,
     pub seed: u64,
+    /// Effective stereo mode (always `LeftRight` for mono input).
+    pub stereo_mode: StereoMode,
+    /// Side duck depth actually applied (mid/side mode only).
+    pub side_duck_db: Option<f64>,
     pub allocator_stage: Option<Stage>,
     pub warnings: Vec<Warning>,
     pub segments: Vec<SegmentReport>,
@@ -147,6 +152,8 @@ impl AnalysisReport {
             achieved_factor: 0.0,
             path: RenderPath::Empty,
             seed,
+            stereo_mode: StereoMode::LeftRight,
+            side_duck_db: None,
             allocator_stage: None,
             warnings: Vec::new(),
             segments: Vec::new(),

@@ -55,6 +55,7 @@ target/release/sable -i speech.wav -o faster.wav -s 0.75 --seed 42 \
 | `--quality fast\|standard\|high` | WSOLA grain/search presets |
 | `--format float32\|pcm16\|pcm24` | output format. The default float32 neither clips nor quantizes. Integer formats round and clip to `[-1, 1)` with **no dither**. |
 | `--no-plosive`, `--no-sibilant` | disable a special renderer |
+| `--stereo-mode lr\|ms` | stereo strategy. `lr` (default) renders every event on both channels, with a stereo noise covariance model for sibilants. `ms` gives the mid the full SABLE treatment and the side WSOLA on the same time map and grain positions, ducked by `--side-duck-db` (default −6) inside the mid's resynthesized sibilants and burst cores. See [COMPROMISES §8](docs/COMPROMISES.md) before using `ms` on panned or spaced-microphone material. |
 | `--skip-leading-silence` | drop silence before the first sound, keeping a 20 ms pre-roll (`--silence-threshold-db`, default −50 dBFS RMS on the loudest channel; `--silence-preroll-ms`). The exact output length then applies to the **trimmed** input, and the skipped frame count is printed and stored under `input` in the diagnostics JSON. |
 | `--generic` | uniform generic WSOLA with all speech handling off (comparison baseline) |
 

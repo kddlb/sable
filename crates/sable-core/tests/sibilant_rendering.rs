@@ -237,6 +237,7 @@ fn stereo_image_is_preserved() {
         StereoLayout::Coherent,
         StereoLayout::Panned,
         StereoLayout::PartiallyDecorrelated,
+        StereoLayout::Delayed,
     ] {
         let fx = synth::stereo_s_fixture(fs, layout, 6);
         let (l, r) = (&fx.audio.channels[0], &fx.audio.channels[1]);

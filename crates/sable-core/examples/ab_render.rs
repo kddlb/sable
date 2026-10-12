@@ -43,14 +43,24 @@ fn main() {
         };
         for f in FACTORS {
             let r = StretchRatio::parse(f).unwrap();
-            for (mode, opts) in [
+            let mut modes = vec![
                 ("sable", Options::default()),
                 ("generic", Options::generic_wsola()),
-            ] {
+            ];
+            if audio.channels.len() == 2 {
+                modes.push((
+                    "sable_ms",
+                    Options {
+                        stereo_mode: sable_core::StereoMode::MidSide,
+                        ..Options::default()
+                    },
+                ));
+            }
+            for (mode, opts) in modes {
                 let out = stretch(&view, r, &opts).unwrap();
                 let tag = format!("{name}_x{}_{mode}", f.replace('.', "p"));
                 common::write_wav(&dir.join(format!("{tag}.wav")), &out.audio);
-                if mode == "sable" {
+                if mode != "generic" {
                     std::fs::write(
                         dir.join(format!("{tag}.json")),
                         serde_json::to_string_pretty(&out.report).unwrap(),

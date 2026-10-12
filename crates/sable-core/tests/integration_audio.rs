@@ -6,9 +6,10 @@ use std::path::PathBuf;
 
 use sable_core::{AudioView, Options, StretchRatio, stretch};
 
-const DEFAULTS: [&str; 2] = [
+const DEFAULTS: [&str; 3] = [
     r"speech1.wav",
     r"speech2.wav",
+    r"speech3.wav",
 ];
 
 fn speech_files() -> Vec<PathBuf> {
