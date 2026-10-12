@@ -14,7 +14,7 @@ length**:
 * **Timing:** a constrained Lagrange allocator distributes the exact frame budget across
   event classes. Infeasible budgets relax in documented, reported stages.
 
-Specification: [SABLE_SPEC.md](SABLE_SPEC.md). Measurements: [QUALITY.md](QUALITY.md).
+**How it works: [docs/ALGORITHM.md](docs/ALGORITHM.md).** Specification: [SABLE_SPEC.md](SABLE_SPEC.md). Measurements: [QUALITY.md](QUALITY.md).
 Trade-offs: [docs/COMPROMISES.md](docs/COMPROMISES.md).
 
 ## Guarantees
