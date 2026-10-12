@@ -61,6 +61,36 @@ The CLI prints source, target and actual frame counts, the achieved factor, the
 allocator stage, and every warning. Stereo is never downmixed; more than 2 channels is an
 error.
 
+## GUI (optional feature)
+
+A desktop front end built with egui/eframe ships behind the `gui` feature, so the default
+build stays headless and dependency-light:
+
+```sh
+cargo run --release -p sable-cli --features gui --bin sable-gui
+# optional: open a file, and optionally process it immediately
+cargo run --release -p sable-cli --features gui --bin sable-gui -- speech.wav 3/2
+```
+
+* Open a WAV (button or drag-and-drop). The analyzer runs in the background, and event
+  classes are shown as coloured bands over the waveform.
+* Set the factor (`p/q` or decimal, with presets), seed, quality, and which renderers are
+  enabled, or pick generic WSOLA for comparison. Processing runs on a worker thread.
+* Original and result are shown stacked, with views synchronized through the segment
+  time map. Marks above the result show where bursts were dry-copied (red) and where
+  sibilant noise was synthesized (orange). Use the wheel to zoom, drag to pan, click to
+  set the cursor, and double-click for the full view.
+* Play the original or the result from the cursor through the default output device
+  (cpal). Space toggles playback. If the device rate differs, playback alone is
+  resampled; saved audio never is.
+* Tabs show the summary (exact frame check, stage, levels, warnings), the segment table
+  (click a row to zoom), renderer decisions with reasons, and burst candidates with
+  their scores.
+* Save the result (float32/pcm16/pcm24), the diagnostics JSON, or all intermediate
+  layers.
+
+On Linux the `gui` feature needs ALSA headers (`libasound2-dev`).
+
 ## Library
 
 ```rust
@@ -103,7 +133,8 @@ crates/sable-core/tests/     allocator, safety, detector, duration, quality, plo
                              sibilant, determinism, real-speech integration tests
 crates/sable-core/examples/  inspect_events, quality_report, ab_render
 crates/sable-core/benches/   speech (realtime factor, no external harness)
-crates/sable-cli/            `sable` binary + CLI tests
+crates/sable-cli/            `sable` binary, shared WAV I/O (lib), CLI tests,
+                             `sable-gui` (src/gui/, feature `gui`)
 ```
 
 The spec suggests a top-level `tests/` directory. Integration tests live in
@@ -127,5 +158,8 @@ Real-speech tests and examples read local recordings from `SABLE_SPEECH_WAV` (a
 committed: `*.wav`, `ab/` and `out/` are gitignored.
 
 Dependencies: `realfft`/`rustfft`, `rand_chacha` (with `rand_core` 0.10), `hound`, `serde`,
-`thiserror`, `clap`, `serde_json`, and `proptest` for tests only. All are pure Rust. The
+`thiserror`, `clap`, `serde_json`, and `proptest` for tests only. The optional `gui` feature
+adds `eframe`/`egui` 0.33 with `egui_extras` (SVG loader) and `egui-twemoji` for colour emoji,
+`rfd` (file dialogs) and `cpal` (playback). The egui stack is pinned to 0.33 because
+`egui-twemoji` 0.8 (the latest release) targets egui 0.33. All are pure Rust. The
 crate uses `#![forbid(unsafe_code)]`.

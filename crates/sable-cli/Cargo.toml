@@ -6,12 +6,34 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[lib]
+name = "sable_cli"
+path = "src/lib.rs"
+
 [[bin]]
 name = "sable"
 path = "src/main.rs"
+
+[[bin]]
+name = "sable-gui"
+path = "src/gui/main.rs"
+required-features = ["gui"]
+
+[features]
+default = []
+# Desktop GUI (egui/eframe) with file dialogs and audio playback.
+gui = ["dep:eframe", "dep:egui_extras", "dep:egui-twemoji", "dep:twemoji-assets", "dep:rfd", "dep:cpal"]
 
 [dependencies]
 sable-core = { path = "../sable-core" }
 hound.workspace = true
 clap.workspace = true
 serde_json.workspace = true
+# egui stack pinned to 0.33: egui-twemoji 0.8 (latest) targets egui 0.33.
+eframe = { version = "0.33", optional = true }
+egui_extras = { version = "0.33", optional = true, default-features = false, features = ["svg"] }
+egui-twemoji = { version = "0.8", optional = true }
+# Same exact version egui-twemoji uses; needed to put Twemoji images on buttons.
+twemoji-assets = { version = "=1.4.0", optional = true, default-features = false, features = ["svg"] }
+rfd = { version = "0.17", optional = true }
+cpal = { version = "0.18", optional = true }
