@@ -1,17 +1,14 @@
 //! Real recordings (local only). Set `SABLE_SPEECH_WAV` to a `;`-separated list of WAV
-//! paths; the maintainer's default paths are used otherwise. Missing files are skipped,
-//! so CI stays green without any committed speech.
+//! paths, or list them (one per line) in the gitignored `speech_files.txt` at the
+//! workspace root. Missing files are skipped, so CI stays green without committed speech.
 
 use std::path::PathBuf;
 
 use sable_core::{AudioView, Options, StretchRatio, stretch};
 
-const DEFAULTS: [&str; 3] = [
-    r"speech1.wav",
-    r"speech2.wav",
-    r"speech3.wav",
-];
-
+/// Local real-speech recordings (never committed): `$SABLE_SPEECH_WAV` (`;`-separated),
+/// otherwise the lines of the gitignored `speech_files.txt` at the workspace root
+/// (one path per line, `#` comments). Missing files are skipped.
 fn speech_files() -> Vec<PathBuf> {
     let list: Vec<PathBuf> = match std::env::var("SABLE_SPEECH_WAV") {
         Ok(v) => v
@@ -19,7 +16,16 @@ fn speech_files() -> Vec<PathBuf> {
             .filter(|s| !s.is_empty())
             .map(PathBuf::from)
             .collect(),
-        Err(_) => DEFAULTS.iter().map(PathBuf::from).collect(),
+        Err(_) => {
+            let file = concat!(env!("CARGO_MANIFEST_DIR"), "/../../speech_files.txt");
+            std::fs::read_to_string(file)
+                .unwrap_or_default()
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                .map(PathBuf::from)
+                .collect()
+        }
     };
     list.into_iter().filter(|p| p.exists()).collect()
 }

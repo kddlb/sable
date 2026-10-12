@@ -1,5 +1,7 @@
 /target
 /ab/
 /out/
+# Local paths to personal test recordings (see README).
+/speech_files.txt
 *.wav
 !/fixtures/**/*.wav

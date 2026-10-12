@@ -187,7 +187,9 @@ cargo run --release -p sable-core --example ab_render
 ```
 
 Real-speech tests and examples read local recordings from `SABLE_SPEECH_WAV` (a
-`;`-separated list of paths). They skip silently when no file is present. No recording is
+`;`-separated list of paths) or, if that is unset, from a gitignored `speech_files.txt` at
+the workspace root (one path per line, `#` comments). They skip silently when no file is
+present. No recording is
 committed: `*.wav`, `ab/` and `out/` are gitignored.
 
 Dependencies: `realfft`/`rustfft`, `rand_chacha` (with `rand_core` 0.10), `hound`, `serde`,
@@ -196,3 +198,8 @@ adds `eframe`/`egui` 0.33 with `egui_extras` (SVG loader) and `egui-twemoji` for
 `rfd` (file dialogs) and `cpal` (playback). The egui stack is pinned to 0.33 because
 `egui-twemoji` 0.8 (the latest release) targets egui 0.33. All are pure Rust. The
 crate uses `#![forbid(unsafe_code)]`.
+
+## License
+
+Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or
+[MIT license](LICENSE-MIT) at your option.

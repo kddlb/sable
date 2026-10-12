@@ -6,14 +6,9 @@ use std::path::{Path, PathBuf};
 use sable_core::AudioBuffer;
 use sable_core::synth::{self, Fixture, Fricative, StereoLayout};
 
-/// Default locations of the maintainer's own speech recordings (never committed).
-pub const DEFAULT_SPEECH: [&str; 3] = [
-    r"speech1.wav",
-    r"speech2.wav",
-    r"speech3.wav",
-];
-
-/// Real speech recordings: `$SABLE_SPEECH_WAV` (`;`-separated) or the defaults that exist.
+/// Local real-speech recordings (never committed): `$SABLE_SPEECH_WAV` (`;`-separated),
+/// otherwise the lines of the gitignored `speech_files.txt` at the workspace root
+/// (one path per line, `#` comments). Missing files are skipped.
 pub fn speech_paths() -> Vec<PathBuf> {
     let list: Vec<PathBuf> = match std::env::var("SABLE_SPEECH_WAV") {
         Ok(v) => v
@@ -21,7 +16,16 @@ pub fn speech_paths() -> Vec<PathBuf> {
             .filter(|s| !s.is_empty())
             .map(PathBuf::from)
             .collect(),
-        Err(_) => DEFAULT_SPEECH.iter().map(PathBuf::from).collect(),
+        Err(_) => {
+            let file = concat!(env!("CARGO_MANIFEST_DIR"), "/../../speech_files.txt");
+            std::fs::read_to_string(file)
+                .unwrap_or_default()
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                .map(PathBuf::from)
+                .collect()
+        }
     };
     list.into_iter().filter(|p| p.exists()).collect()
 }
