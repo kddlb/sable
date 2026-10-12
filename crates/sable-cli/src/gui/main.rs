@@ -91,8 +91,20 @@ impl Settings {
     }
 }
 
+/// A running processing job.
+struct Job {
+    rx: Receiver<Result<Done, String>>,
+    started: Instant,
+    settings: Settings,
+}
+
+/// Delay after the last settings edit before auto-processing starts.
+const AUTO_DEBOUNCE: Duration = Duration::from_millis(300);
+
 struct Done {
     result: Arc<ProcessResult>,
+    /// Result audio shared with the player (avoids copying on every play).
+    audio: Arc<AudioBuffer>,
     settings: Settings,
     elapsed: Duration,
     /// Leading input frames dropped before stretching (skip-silence option).
@@ -112,7 +124,7 @@ struct App {
     settings: Settings,
     format: Format,
     analyze_rx: Option<Receiver<AnalysisMsg>>,
-    process_rx: Option<(Receiver<Result<Done, String>>, Instant)>,
+    process_rx: Option<Job>,
     done: Option<Done>,
     status: String,
     error: Option<String>,
@@ -124,6 +136,13 @@ struct App {
     selected: Option<usize>,
     tab: Tab,
     show_masks: bool,
+    /// Re-run processing automatically when settings change.
+    auto_process: bool,
+    /// Settings seen last frame (change detection) and when they last changed.
+    last_settings: Settings,
+    changed_at: Option<Instant>,
+    /// Settings whose processing failed (not retried automatically).
+    failed_settings: Option<Settings>,
 }
 
 impl App {
@@ -157,7 +176,21 @@ impl App {
             selected: None,
             tab: Tab::Summary,
             show_masks: true,
+            auto_process: true,
+            last_settings: Settings {
+                ratio_text: String::new(),
+                seed: 0,
+                quality: QualityPreset::Standard,
+                plosive: true,
+                sibilant: true,
+                generic: false,
+                skip_silence: false,
+                silence_db: 0.0,
+            },
+            changed_at: None,
+            failed_settings: None,
         };
+        app.last_settings = app.settings.clone();
         if let Some(p) = initial {
             app.open(&p, &cc.egui_ctx);
             if let Some(r) = auto_ratio {
@@ -243,6 +276,7 @@ impl App {
             };
             let r = stretch(&view, ratio, &settings.options())
                 .map(|result| Done {
+                    audio: Arc::new(result.audio.clone()),
                     result: Arc::new(result),
                     settings,
                     elapsed: t.elapsed(),
@@ -252,7 +286,11 @@ impl App {
             let _ = tx.send(r);
             ctx2.request_repaint();
         });
-        self.process_rx = Some((rx, Instant::now()));
+        self.process_rx = Some(Job {
+            rx,
+            started: Instant::now(),
+            settings: self.settings.clone(),
+        });
         self.status = "Processing…".into();
     }
 
@@ -270,12 +308,18 @@ impl App {
                 _ => {}
             }
         }
-        if let Some((rx, _)) = &self.process_rx
-            && let Ok(r) = rx.try_recv()
+        if let Some(job) = &self.process_rx
+            && let Ok(r) = job.rx.try_recv()
         {
+            let job_settings = job.settings.clone();
             self.process_rx = None;
             match r {
                 Ok(done) => {
+                    // Keep playing the result across reprocessing: same source position.
+                    let resume = match self.playing() {
+                        Some((Source::Result, pos, _)) => Some(self.out_to_in(pos)),
+                        _ => None,
+                    };
                     let rep = &done.result.report;
                     self.status = format!(
                         "Done in {:.0} ms: {} frames in, {} frames out (exact), {} warning(s)",
@@ -285,13 +329,78 @@ impl App {
                         rep.warnings.len()
                     );
                     self.error = None;
+                    self.failed_settings = None;
                     self.done = Some(done);
+                    if let Some(x) = resume {
+                        self.play_result(x);
+                    }
                 }
                 Err(e) => {
                     self.error = Some(e);
+                    self.failed_settings = Some(job_settings);
                     self.status = "Processing failed".into();
                 }
             }
+        }
+    }
+
+    fn playing(&self) -> Option<(Source, f64, f64)> {
+        self.player.as_ref().ok().and_then(|p| p.status())
+    }
+
+    /// Current listening position in input frames: the playhead if playing, else the cursor.
+    fn position_in(&self) -> f64 {
+        match self.playing() {
+            Some((Source::Original, p, _)) => p,
+            Some((Source::Result, p, _)) => self.out_to_in(p),
+            None => self.cursor,
+        }
+    }
+
+    fn input_frames(&self) -> f64 {
+        self.input.as_ref().map_or(0.0, |i| i.audio.frames() as f64)
+    }
+
+    fn play_original(&self, from_in: f64) {
+        if let (Ok(p), Some(inp)) = (&self.player, &self.input) {
+            p.play(
+                inp.audio.clone(),
+                Source::Original,
+                from_in.max(0.0) as usize,
+            );
+        }
+    }
+
+    fn play_result(&self, from_in: f64) {
+        if let (Ok(p), Some(d)) = (&self.player, &self.done) {
+            p.play(
+                d.audio.clone(),
+                Source::Result,
+                self.in_to_out(from_in).max(0.0) as usize,
+            );
+        }
+    }
+
+    /// Moves the cursor to `x_in` (input frames) and, if playing, seeks the playing
+    /// buffer to the equivalent position.
+    fn seek_in(&mut self, x_in: f64) {
+        let x = x_in.clamp(0.0, (self.input_frames() - 1.0).max(0.0));
+        self.cursor = x;
+        if let (Ok(p), Some((src, _, _))) = (&self.player, self.playing()) {
+            match src {
+                Source::Original => p.seek(x),
+                Source::Result => p.seek(self.in_to_out(x).max(0.0)),
+            }
+        }
+    }
+
+    /// Stops playback, leaving the cursor where playback was (so Space resumes there).
+    fn stop_playback(&mut self) {
+        if self.playing().is_some() {
+            self.cursor = self.position_in();
+        }
+        if let Ok(p) = &self.player {
+            p.stop();
         }
     }
 
@@ -525,9 +634,11 @@ impl App {
                 if btn.clicked() || (enter && can) {
                     self.process(&ctx);
                 }
-                if let Some((_, t)) = &self.process_rx {
+                ui.checkbox(&mut self.auto_process, "Auto")
+                    .on_hover_text("Reprocess automatically when a setting changes.");
+                if let Some(job) = &self.process_rx {
                     ui.add(egui::Spinner::new());
-                    ui.label(format!("{:.1} s", t.elapsed().as_secs_f64()));
+                    ui.label(format!("{:.1} s", job.started.elapsed().as_secs_f64()));
                 }
             });
             if let Some(d) = &self.done
@@ -535,7 +646,11 @@ impl App {
             {
                 ui.colored_label(
                     Color32::from_rgb(230, 160, 40),
-                    "Settings changed since this result.",
+                    if self.auto_process && self.failed_settings.as_ref() != Some(&self.settings) {
+                        "Settings changed: reprocessing…"
+                    } else {
+                        "Settings changed since this result."
+                    },
                 );
             }
 
@@ -547,32 +662,43 @@ impl App {
             match &self.player {
                 Ok(p) => {
                     let playing = p.status();
+                    let pos = self.position_in();
+                    let mut action = None;
                     ui.horizontal(|ui| {
-                        if let Some(inp) = &self.input
-                            && ui.add(emoji_button("▶️", "Original")).clicked()
+                        if self.input.is_some()
+                            && ui
+                                .add(emoji_button("▶️", "Original"))
+                                .on_hover_text("Play the original from the current position")
+                                .clicked()
                         {
-                            p.play(inp.audio.clone(), Source::Original, self.cursor as usize);
+                            action = Some(Source::Original);
                         }
-                        if let Some(d) = &self.done
-                            && ui.add(emoji_button("▶️", "Result")).clicked()
+                        if self.done.is_some()
+                            && ui
+                                .add(emoji_button("▶️", "Result"))
+                                .on_hover_text("Play the result from the same source position")
+                                .clicked()
                         {
-                            let buf = Arc::new(d.result.audio.clone());
-                            p.play(
-                                buf,
-                                Source::Result,
-                                self.in_to_out(self.cursor).max(0.0) as usize,
-                            );
+                            action = Some(Source::Result);
                         }
                         if ui
                             .add_enabled(playing.is_some(), emoji_button("⏹️", "Stop"))
                             .clicked()
                         {
+                            action = None;
                             p.stop();
+                            self.cursor = pos;
                         }
                     });
+                    match action {
+                        Some(Source::Original) => self.play_original(pos),
+                        Some(Source::Result) => self.play_result(pos),
+                        None => {}
+                    }
                     ui.label(
                         RichText::new(
-                            "Plays from the cursor (click a waveform). Space = play/stop result.",
+                            "Original/Result switch keeps the position. Click a waveform to seek. \
+                             Space play/stop, Left/Right 1 s (Shift 5 s), Home start.",
                         )
                         .weak()
                         .small(),
@@ -743,7 +869,9 @@ impl App {
                 selected: Some(s.5) == self.selected,
             })
             .collect();
-        let playing = self.player.as_ref().ok().and_then(|p| p.status());
+        self.transport(ui);
+        ui.add_space(4.0);
+        let playing = self.playing();
         let has_result = self.done.is_some();
         let avail = ui.available_height();
         let lane_h = if has_result {
@@ -871,7 +999,7 @@ impl App {
                 && let Some(hin) = hover_in
             {
                 let hin = hin.clamp(0.0, n_in);
-                self.cursor = hin;
+                self.seek_in(hin);
                 self.selected = segs
                     .iter()
                     .find(|s| (s.0 as f64) <= hin && hin < s.1 as f64)
@@ -883,6 +1011,53 @@ impl App {
         }
     }
 
+    /// Position readout and seek slider for the playing buffer (or the cursor).
+    fn transport(&mut self, ui: &mut egui::Ui) {
+        let fs_in = self.input.as_ref().map_or(48_000, |i| i.audio.sample_rate) as f64;
+        let playing = self.playing();
+        // The slider works in the coordinates of what is playing (result or original).
+        let (label, mut pos, len, fs) = match playing {
+            Some((Source::Result, p, l)) => (
+                "Result",
+                p,
+                l,
+                self.done
+                    .as_ref()
+                    .map_or(fs_in, |d| d.audio.sample_rate as f64),
+            ),
+            Some((Source::Original, p, l)) => ("Original", p, l, fs_in),
+            None => ("Cursor", self.cursor, self.input_frames(), fs_in),
+        };
+        let len = len.max(1.0);
+        ui.horizontal(|ui| {
+            if ui
+                .add(emoji_button("⏮️", ""))
+                .on_hover_text("Back to start (Home)")
+                .clicked()
+            {
+                self.seek_in(0.0);
+            }
+            let txt = format!("{label:<8} {:>7.3} / {:.3} s", pos / fs, len / fs);
+            ui.add_sized(
+                [200.0, 18.0],
+                egui::Label::new(RichText::new(txt).monospace()),
+            );
+            ui.spacing_mut().slider_width = (ui.available_width() - 12.0).max(80.0);
+            let resp = ui.add(
+                egui::Slider::new(&mut pos, 0.0..=(len - 1.0).max(0.0))
+                    .show_value(false)
+                    .trailing_fill(true),
+            );
+            if resp.changed() {
+                let x_in = match playing {
+                    Some((Source::Result, _, _)) => self.out_to_in(pos),
+                    _ => pos,
+                };
+                self.seek_in(x_in);
+            }
+        });
+    }
+
     fn bottom_tabs(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.selectable_value(&mut self.tab, Tab::Summary, "Summary");
@@ -891,7 +1066,7 @@ impl App {
             ui.selectable_value(&mut self.tab, Tab::Bursts, "Burst candidates");
             ui.separator();
             ui.label(
-                RichText::new("wheel: zoom · drag: pan · click: cursor · double-click: full view")
+                RichText::new("wheel: zoom · drag: pan · click: seek · double-click: full view")
                     .weak()
                     .small(),
             );
@@ -1200,26 +1375,73 @@ impl eframe::App for App {
         if let Some(p) = dropped {
             self.open(&p, ctx);
         }
-        // Space toggles playback of the result (or the original before processing).
-        if ctx.input(|i| i.key_pressed(egui::Key::Space))
-            && !ctx.wants_keyboard_input()
-            && let Ok(p) = &self.player
-        {
-            if p.status().is_some() {
-                p.stop();
-            } else if let Some(d) = &self.done {
-                p.play(
-                    Arc::new(d.result.audio.clone()),
-                    Source::Result,
-                    self.in_to_out(self.cursor).max(0.0) as usize,
-                );
-            } else if let Some(inp) = &self.input {
-                p.play(inp.audio.clone(), Source::Original, self.cursor as usize);
+        // Transport keys (ignored while typing in a text field).
+        if !ctx.wants_keyboard_input() {
+            // Consume the keys so a focused slider or button does not also react to them.
+            let (space, left, right, home, shift) = ctx.input_mut(|i| {
+                let shift = i.modifiers.shift;
+                let m = if shift {
+                    egui::Modifiers::SHIFT
+                } else {
+                    egui::Modifiers::NONE
+                };
+                (
+                    i.consume_key(m, egui::Key::Space),
+                    i.consume_key(m, egui::Key::ArrowLeft),
+                    i.consume_key(m, egui::Key::ArrowRight),
+                    i.consume_key(m, egui::Key::Home),
+                    shift,
+                )
+            });
+            if space {
+                if self.playing().is_some() {
+                    self.stop_playback();
+                } else if self.done.is_some() {
+                    self.play_result(self.cursor);
+                } else {
+                    self.play_original(self.cursor);
+                }
+            }
+            let fs = self.input.as_ref().map_or(48_000, |i| i.audio.sample_rate) as f64;
+            let step = if shift { 5.0 } else { 1.0 } * fs;
+            if left {
+                self.seek_in(self.position_in() - step);
+            }
+            if right {
+                self.seek_in(self.position_in() + step);
+            }
+            if home {
+                self.seek_in(0.0);
             }
         }
-        let busy = self.process_rx.is_some()
-            || self.analyze_rx.is_some()
-            || self.player.as_ref().ok().and_then(|p| p.status()).is_some();
+        // Auto-process: debounce settings edits; never retry a failed configuration.
+        if self.settings != self.last_settings {
+            self.last_settings = self.settings.clone();
+            self.changed_at = Some(Instant::now());
+        }
+        if self.auto_process
+            && self.process_rx.is_none()
+            && self.analyze_rx.is_none()
+            && self.input.is_some()
+            && self.ratio().is_ok()
+            && self
+                .done
+                .as_ref()
+                .is_none_or(|d| d.settings != self.settings)
+            && self.failed_settings.as_ref() != Some(&self.settings)
+        {
+            let wait = self.changed_at.map_or(Duration::ZERO, |t| {
+                AUTO_DEBOUNCE.saturating_sub(t.elapsed())
+            });
+            if wait.is_zero() {
+                self.changed_at = None;
+                self.process(ctx);
+            } else {
+                ctx.request_repaint_after(wait);
+            }
+        }
+        let busy =
+            self.process_rx.is_some() || self.analyze_rx.is_some() || self.playing().is_some();
         if busy {
             ctx.request_repaint_after(Duration::from_millis(33));
         }

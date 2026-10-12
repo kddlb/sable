@@ -102,12 +102,18 @@ cargo run --release -p sable-cli --features gui --bin sable-gui -- speech.wav 3/
   classes are shown as coloured bands over the waveform.
 * Set the factor (`p/q` or decimal, with presets), seed, quality, and which renderers are
   enabled, or pick generic WSOLA for comparison. Processing runs on a worker thread.
+  With **Auto** on (the default), any settings change reprocesses after a 300 ms pause in
+  editing. If the result is playing, playback continues in the new result at the same
+  source position. A configuration that failed is not retried until it changes.
 * Original and result are shown stacked, with views synchronized through the segment
   time map. Marks above the result show where bursts were dry-copied (red) and where
   sibilant noise was synthesized (orange). Use the wheel to zoom, drag to pan, click to
   set the cursor, and double-click for the full view.
-* Play the original or the result from the cursor through the default output device
-  (cpal). Space toggles playback. If the device rate differs, playback alone is
+* Play the original or the result through the default output device (cpal).
+  Switching between them keeps the position, for A/B comparison. **Seek** by clicking a
+  waveform (also while playing), by dragging the transport slider, with ←/→ (±1 s,
+  Shift ±5 s), or with Home / ⏮ to go back to the start. Space plays or stops, and
+  stopping leaves the cursor where playback was. If the device rate differs, playback alone is
   resampled; saved audio never is.
 * Tabs show the summary (exact frame check, stage, levels, warnings), the segment table
   (click a row to zoom), renderer decisions with reasons, and burst candidates with

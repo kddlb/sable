@@ -85,10 +85,20 @@ impl Player {
         self.state.lock().unwrap().playing = false;
     }
 
-    /// `(source, position in frames)` while playing.
-    pub fn status(&self) -> Option<(Source, f64)> {
+    /// Moves the read position of the current buffer (clamped to its length).
+    /// Works while playing; a no-op when nothing is loaded.
+    pub fn seek(&self, frame: f64) {
+        let mut s = self.state.lock().unwrap();
+        if let Some(len) = s.buf.as_ref().map(|b| b.frames() as f64) {
+            s.pos = frame.clamp(0.0, (len - 1.0).max(0.0));
+        }
+    }
+
+    /// `(source, position, length)` in frames of the playing buffer, while playing.
+    pub fn status(&self) -> Option<(Source, f64, f64)> {
         let s = self.state.lock().unwrap();
-        s.playing.then_some((s.source, s.pos))
+        let len = s.buf.as_ref().map_or(0.0, |b| b.frames() as f64);
+        s.playing.then_some((s.source, s.pos, len))
     }
 }
 
