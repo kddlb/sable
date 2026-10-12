@@ -26,6 +26,8 @@ pub struct Options {
     pub enable_sibilant: bool,
     /// Also return intermediate layers (baseline, overlays, masks) for inspection.
     pub keep_layers: bool,
+    /// Skip event detection and use one uniform time map (generic WSOLA baseline).
+    pub uniform_timing: bool,
 }
 
 impl Default for Options {
@@ -38,6 +40,7 @@ impl Default for Options {
             enable_plosive: true,
             enable_sibilant: true,
             keep_layers: false,
+            uniform_timing: false,
         }
     }
 }
@@ -48,6 +51,7 @@ impl Options {
         Self {
             enable_plosive: false,
             enable_sibilant: false,
+            uniform_timing: true,
             ..Self::default()
         }
     }

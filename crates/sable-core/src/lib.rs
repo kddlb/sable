@@ -7,7 +7,7 @@
 //!
 //! `N_out = floor(N_in * p / q + 1/2)` for stretch factor `r = p/q = duration_out / duration_in`.
 //!
-//! ```no_run
+//! ```
 //! use sable_core::{stretch, AudioView, Options, StretchRatio};
 //! let tone: Vec<f32> = (0..4800).map(|i| (i as f32 * 0.05).sin() * 0.3).collect();
 //! let chans = [tone.as_slice()];
@@ -25,12 +25,18 @@ pub mod detect;
 pub mod error;
 pub mod features;
 pub mod fft;
+pub mod metrics;
 pub mod options;
+pub mod pipeline;
+pub mod plosives;
 pub mod ratio;
 pub mod report;
 pub mod segments;
+pub mod sibilants;
 pub mod synth;
+pub mod timemap;
 pub mod windows;
+pub mod wsola;
 
 pub use audio::{AudioBuffer, AudioView};
 pub use error::StretchError;
@@ -120,6 +126,7 @@ pub fn stretch(
         });
     }
 
+    let mut layers = None;
     let channels: Vec<Vec<f32>> = if n_in == 0 {
         report.path = RenderPath::Empty;
         vec![Vec::new(); nch]
@@ -132,12 +139,14 @@ pub fn stretch(
         report.path = RenderPath::Silence;
         vec![vec![0.0; n_out as usize]; nch]
     } else {
-        return Err(StretchError::Internal(
-            "general rendering path not yet implemented".into(),
-        ));
+        let (out, l) = pipeline::render(input, ratio, n_out, options, &mut report)?;
+        layers = l;
+        out
     };
 
-    finish(input, channels, report)
+    let mut result = finish(input, channels, report)?;
+    result.layers = layers;
+    Ok(result)
 }
 
 fn finish(

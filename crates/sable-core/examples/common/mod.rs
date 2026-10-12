@@ -6,15 +6,28 @@ use std::path::{Path, PathBuf};
 use sable_core::AudioBuffer;
 use sable_core::synth::{self, Fixture, Fricative, StereoLayout};
 
-/// Default location of the maintainer's own speech recording (never committed).
-pub const DEFAULT_SPEECH: &str = r"speech1.wav";
+/// Default locations of the maintainer's own speech recordings (never committed).
+pub const DEFAULT_SPEECH: [&str; 2] = [
+    r"speech1.wav",
+    r"speech2.wav",
+];
 
-/// Path to a real speech recording: `$SABLE_SPEECH_WAV` or the default, if it exists.
+/// Real speech recordings: `$SABLE_SPEECH_WAV` (`;`-separated) or the defaults that exist.
+pub fn speech_paths() -> Vec<PathBuf> {
+    let list: Vec<PathBuf> = match std::env::var("SABLE_SPEECH_WAV") {
+        Ok(v) => v
+            .split(';')
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+            .collect(),
+        Err(_) => DEFAULT_SPEECH.iter().map(PathBuf::from).collect(),
+    };
+    list.into_iter().filter(|p| p.exists()).collect()
+}
+
+/// First available real speech recording.
 pub fn speech_path() -> Option<PathBuf> {
-    let p = std::env::var_os("SABLE_SPEECH_WAV")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(DEFAULT_SPEECH));
-    p.exists().then_some(p)
+    speech_paths().into_iter().next()
 }
 
 pub fn read_wav(path: &Path) -> Result<AudioBuffer, String> {
