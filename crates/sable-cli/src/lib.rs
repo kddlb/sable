@@ -281,17 +281,24 @@ fn deinterleave(interleaved: &[f32], nch: usize, sample_rate: u32) -> AudioBuffe
 }
 
 pub mod trim {
-    //! Optional removal of leading silence before stretching (front-end preprocessing;
-    //! the stretch itself and its exact-length contract apply to the trimmed audio).
+    //! Optional removal of leading and trailing silence before stretching (front-end
+    //! preprocessing; the stretch itself and its exact-length contract apply to the
+    //! trimmed audio).
 
     use sable_core::AudioBuffer;
 
     #[derive(Clone, Copy, Debug, PartialEq)]
     pub struct SilenceTrim {
+        /// Drop silence before the first sound.
+        pub leading: bool,
+        /// Drop silence after the last sound.
+        pub trailing: bool,
         /// Level (dBFS RMS over `window_ms`, loudest channel) that counts as sound.
         pub threshold_db: f64,
         /// Audio kept before the first sound so its onset is not clipped.
         pub preroll_ms: f64,
+        /// Audio kept after the last sound so its decay is not clipped.
+        pub postroll_ms: f64,
         /// RMS window used for detection.
         pub window_ms: f64,
     }
@@ -299,56 +306,100 @@ pub mod trim {
     impl Default for SilenceTrim {
         fn default() -> Self {
             Self {
+                leading: true,
+                trailing: false,
                 threshold_db: -50.0,
                 preroll_ms: 20.0,
+                postroll_ms: 50.0,
                 window_ms: 5.0,
             }
         }
     }
 
-    /// Number of leading frames to drop. Returns 0 if the whole clip is below the
-    /// threshold (never empties a file).
-    pub fn leading_silence_frames(audio: &AudioBuffer, cfg: &SilenceTrim) -> usize {
+    /// Frames removed from each end of the input.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub struct Trimmed {
+        pub leading: usize,
+        pub trailing: usize,
+    }
+
+    /// Index of the first (or, with `from_end`, last) sample at the threshold level,
+    /// found window by window from that end.
+    fn edge_sound(audio: &AudioBuffer, cfg: &SilenceTrim, from_end: bool) -> Option<usize> {
         let n = audio.frames();
         let fs = audio.sample_rate as f64;
         let w = ((cfg.window_ms * fs / 1000.0).round() as usize).max(1);
         let thr = 10f64.powf(cfg.threshold_db / 10.0); // mean-square threshold
-        let mut first = None;
-        let mut start = 0;
-        while start < n {
-            let end = (start + w).min(n);
-            let loud = audio.channels.iter().any(|c| {
+        let amp = thr.sqrt() as f32;
+        let windows = (0..n.div_ceil(w)).map(|k| (k * w, ((k + 1) * w).min(n)));
+        let loud = |&(start, end): &(usize, usize)| {
+            audio.channels.iter().any(|c| {
                 let ms = c[start..end]
                     .iter()
                     .map(|&v| (v as f64).powi(2))
                     .sum::<f64>()
                     / (end - start) as f64;
                 ms >= thr
-            });
-            if loud {
-                // Refine to the first sample in this window above the RMS threshold level.
-                let amp = thr.sqrt() as f32;
-                let s = (start..end)
-                    .find(|&i| audio.channels.iter().any(|c| c[i].abs() >= amp))
-                    .unwrap_or(start);
-                first = Some(s);
-                break;
-            }
-            start = end;
+            })
+        };
+        let peak = |i: &usize| audio.channels.iter().any(|c| c[*i].abs() >= amp);
+        // Refine to the outermost sample in the loud window above the RMS threshold level.
+        if from_end {
+            let (start, end) = windows.rev().find(loud)?;
+            Some((start..end).rev().find(peak).unwrap_or(end - 1))
+        } else {
+            let (start, end) = windows.clone().find(loud)?;
+            Some((start..end).find(peak).unwrap_or(start))
         }
-        let Some(first) = first else { return 0 };
-        let pre = (cfg.preroll_ms * fs / 1000.0).round() as usize;
+    }
+
+    /// Number of leading frames to drop. Returns 0 if the whole clip is below the
+    /// threshold (never empties a file).
+    pub fn leading_silence_frames(audio: &AudioBuffer, cfg: &SilenceTrim) -> usize {
+        let Some(first) = edge_sound(audio, cfg, false) else {
+            return 0;
+        };
+        let pre = (cfg.preroll_ms * audio.sample_rate as f64 / 1000.0).round() as usize;
         first.saturating_sub(pre)
     }
 
-    /// Copy of `audio` without its first `frames` frames.
-    pub fn skip_frames(audio: &AudioBuffer, frames: usize) -> AudioBuffer {
+    /// Number of trailing frames to drop. Returns 0 if the whole clip is below the
+    /// threshold (never empties a file).
+    pub fn trailing_silence_frames(audio: &AudioBuffer, cfg: &SilenceTrim) -> usize {
+        let Some(last) = edge_sound(audio, cfg, true) else {
+            return 0;
+        };
+        let post = (cfg.postroll_ms * audio.sample_rate as f64 / 1000.0).round() as usize;
+        audio.frames().saturating_sub(last + 1).saturating_sub(post)
+    }
+
+    /// What `cfg` removes from `audio` (only the ends it enables).
+    pub fn silence_to_trim(audio: &AudioBuffer, cfg: &SilenceTrim) -> Trimmed {
+        let leading = if cfg.leading {
+            leading_silence_frames(audio, cfg)
+        } else {
+            0
+        };
+        let trailing = if cfg.trailing {
+            trailing_silence_frames(audio, cfg)
+        } else {
+            0
+        };
+        Trimmed { leading, trailing }
+    }
+
+    /// Copy of `audio` without the frames `t` removes from each end.
+    pub fn trim_frames(audio: &AudioBuffer, t: Trimmed) -> AudioBuffer {
         AudioBuffer {
             sample_rate: audio.sample_rate,
             channels: audio
                 .channels
                 .iter()
-                .map(|c| c[frames.min(c.len())..].to_vec())
+                .map(|c| {
+                    let a = t.leading.min(c.len());
+                    let b = c.len().saturating_sub(t.trailing).max(a);
+                    c[a..b].to_vec()
+                })
                 .collect(),
         }
     }
@@ -373,7 +424,13 @@ pub mod trim {
             let a = buf(x);
             let cfg = SilenceTrim::default(); // 20 ms preroll at 1 kHz = 20 frames
             assert_eq!(leading_silence_frames(&a, &cfg), 580);
-            let t = skip_frames(&a, 580);
+            let t = trim_frames(
+                &a,
+                Trimmed {
+                    leading: 580,
+                    trailing: 0,
+                },
+            );
             assert_eq!(t.frames(), 420);
         }
 
@@ -396,6 +453,30 @@ pub mod trim {
         }
 
         #[test]
+        fn trailing_trim_keeps_postroll() {
+            let mut x = vec![0.0f32; 1000];
+            for v in &mut x[100..400] {
+                *v = 0.5;
+            }
+            let a = buf(x);
+            let cfg = SilenceTrim {
+                trailing: true,
+                ..SilenceTrim::default()
+            }; // 20 ms pre-roll, 50 ms post-roll at 1 kHz
+            assert_eq!(
+                silence_to_trim(&a, &cfg),
+                Trimmed {
+                    leading: 80,
+                    trailing: 550
+                }
+            );
+            let t = trim_frames(&a, silence_to_trim(&a, &cfg));
+            assert_eq!(t.frames(), 370);
+            assert_eq!(trailing_silence_frames(&buf(vec![0.0; 500]), &cfg), 0);
+            assert_eq!(trailing_silence_frames(&buf(vec![0.2; 500]), &cfg), 0);
+        }
+
+        #[test]
         fn stereo_uses_loudest_channel() {
             let a = AudioBuffer {
                 sample_rate: 1000,
@@ -410,18 +491,18 @@ pub mod trim {
     }
 }
 
-/// Convenience used by both front ends: read a file, optionally skip leading silence.
-/// Returns the audio to process and the number of skipped frames.
+/// Convenience used by both front ends: read a file, optionally trim silence at its ends.
+/// Returns the audio to process and the frames removed from each end.
 pub fn load_input(
     path: &Path,
     trim: Option<&trim::SilenceTrim>,
-) -> Result<(AudioBuffer, usize), String> {
+) -> Result<(AudioBuffer, trim::Trimmed), String> {
     let audio = read_audio(path)?;
     match trim {
         Some(cfg) => {
-            let n = trim::leading_silence_frames(&audio, cfg);
-            Ok((trim::skip_frames(&audio, n), n))
+            let t = trim::silence_to_trim(&audio, cfg);
+            Ok((trim::trim_frames(&audio, t), t))
         }
-        None => Ok((audio, 0)),
+        None => Ok((audio, trim::Trimmed::default())),
     }
 }

@@ -276,3 +276,131 @@ fn skips_leading_silence_before_stretching() {
     assert_eq!(json["n_in"], 8_320);
     assert_eq!(hound::WavReader::open(&output).unwrap().duration(), 16_640);
 }
+
+#[test]
+fn duration_targets_exact_output_length() {
+    let d = tmp_dir("duration");
+    let input = d.join("in.wav");
+    write_wav(&input, 1, 44_100, 44_100, 16);
+    // 1 s in; each target is reached frame-exactly.
+    for (arg, frames) in [
+        ("0.8", 35_280u32),
+        ("0:00.75s", 33_075),
+        ("1250ms", 55_125),
+        ("40001f", 40_001),
+    ] {
+        let output = d.join(format!("out-{frames}.wav"));
+        let out = sable(&[
+            "-i",
+            input.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+            "--duration",
+            arg,
+        ]);
+        assert!(
+            out.status.success(),
+            "{arg}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains(&format!("actual frames  {frames}")),
+            "{stdout}"
+        );
+        assert_eq!(hound::WavReader::open(&output).unwrap().duration(), frames);
+    }
+}
+
+#[test]
+fn max_duration_only_shortens() {
+    let d = tmp_dir("maxdur");
+    let input = d.join("in.wav");
+    write_wav(&input, 1, 16_000, 16_000, 16);
+    for (arg, frames) in [("2", 16_000u32), ("0.5", 8_000)] {
+        let output = d.join(format!("out-{frames}.wav"));
+        let out = sable(&[
+            "-i",
+            input.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+            "--max-duration",
+            arg,
+        ]);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(hound::WavReader::open(&output).unwrap().duration(), frames);
+    }
+}
+
+#[test]
+fn length_options_are_exclusive_and_required() {
+    let d = tmp_dir("lenopts");
+    let input = d.join("in.wav");
+    let output = d.join("out.wav");
+    write_wav(&input, 1, 16_000, 1_600, 16);
+    let (i, o) = (input.to_str().unwrap(), output.to_str().unwrap());
+    assert!(!sable(&["-i", i, "-o", o]).status.success());
+    assert!(
+        !sable(&["-i", i, "-o", o, "-s", "2", "--duration", "1"])
+            .status
+            .success()
+    );
+    let bad = sable(&["-i", i, "-o", o, "--duration", "1:75"]);
+    assert!(!bad.status.success());
+    assert!(String::from_utf8_lossy(&bad.stderr).contains("target duration"));
+}
+
+#[test]
+fn duration_applies_after_trimming_both_ends() {
+    let d = tmp_dir("trimdur");
+    let input = d.join("in.wav");
+    let output = d.join("out.wav");
+    let diag = d.join("d.json");
+    // 0.5 s silence, 0.5 s tone, 0.5 s silence at 16 kHz.
+    let spec = hound::WavSpec {
+        channels: 1,
+        sample_rate: 16_000,
+        bits_per_sample: 32,
+        sample_format: hound::SampleFormat::Float,
+    };
+    let mut w = hound::WavWriter::create(&input, spec).unwrap();
+    for i in 0..24_000 {
+        let v = if (8_000..16_000).contains(&i) {
+            ((i as f32) * 0.05).sin() * 0.3
+        } else {
+            0.0
+        };
+        w.write_sample(v).unwrap();
+    }
+    w.finalize().unwrap();
+    let out = sable(&[
+        "-i",
+        input.to_str().unwrap(),
+        "-o",
+        output.to_str().unwrap(),
+        "--duration",
+        "0.4",
+        "--skip-leading-silence",
+        "--skip-trailing-silence",
+        "--diagnostics",
+        diag.to_str().unwrap(),
+    ]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&diag).unwrap()).unwrap();
+    assert_eq!(json["input"]["skipped_leading_frames"], 7_680);
+    let trailing = json["input"]["skipped_trailing_frames"].as_u64().unwrap();
+    // Last loud sample is within the final window before 16000; 50 ms post-roll kept.
+    assert!((7_100..=7_200).contains(&trailing), "{trailing}");
+    assert_eq!(json["n_in"].as_u64().unwrap(), 24_000 - 7_680 - trailing);
+    assert_eq!(json["input"]["target_duration"]["frames"], 6_400);
+    assert_eq!(hound::WavReader::open(&output).unwrap().duration(), 6_400);
+}

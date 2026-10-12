@@ -44,6 +44,7 @@ pub mod segments;
 pub mod sibilants;
 pub mod stereo;
 pub mod synth;
+pub mod target;
 pub mod timemap;
 pub mod windows;
 pub mod wsola;
@@ -54,6 +55,7 @@ pub use options::{FormantMode, MAX_PITCH_SEMITONES, Options, QualityPreset, Ster
 pub use progress::{Phase, ProgressEvent};
 pub use ratio::StretchRatio;
 pub use report::{AnalysisReport, PitchReport, RenderPath, Warning};
+pub use target::{TargetDuration, TargetMode};
 
 use progress::Progress;
 

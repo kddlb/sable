@@ -40,6 +40,8 @@ For stretch factor `r = p/q = duration_out / duration_in` (so `r > 1` makes the 
 cargo build --release
 # 1.5x longer
 target/release/sable --input speech.wav --output stretched.wav --stretch 3/2
+# fit a disclaimer read into exactly 15 s of speech
+target/release/sable -i disclaimer.wav -o fitted.wav --duration 15s     --skip-leading-silence --skip-trailing-silence
 # faster, with diagnostics and intermediate layers
 target/release/sable -i speech.wav -o faster.wav -s 0.75 --seed 42 \
     --diagnostics events.json --dump-dir layers/
@@ -48,6 +50,8 @@ target/release/sable -i speech.wav -o faster.wav -s 0.75 --seed 42 \
 | option | meaning |
 |---|---|
 | `--stretch` | `p/q` or decimal (`1.25`), parsed exactly |
+| `--duration D` | instead of `--stretch`: hit an exact output duration, e.g. to fit a disclaimer read into a slot. `D` is seconds (`29.5`, `29.5s`), `1500ms`, clock time (`0:29.5`, `1:02.250`) or a frame count (`720000f`), parsed exactly and rounded to the nearest frame. The factor becomes `N_target / N_in`, so the output has exactly `N_target` frames. Applies to the input after any silence trimming. |
+| `--max-duration D` | like `--duration`, but only shortens: an input already within `D` keeps its length (factor 1) |
 | `--seed` | seed for sibilant noise (default fixed) |
 | `--diagnostics FILE` | JSON report: frame counts, segment table with local ratios, detector scores, allocator stage, overlay decisions, WSOLA stats, peak/RMS before and after |
 | `--features` | also include per-frame analysis features in the report |
@@ -57,6 +61,7 @@ target/release/sable -i speech.wav -o faster.wav -s 0.75 --seed 42 \
 | `--no-plosive`, `--no-sibilant` | disable a special renderer |
 | `--stereo-mode lr\|ms` | stereo strategy. `lr` (default) renders every event on both channels, with a stereo noise covariance model for sibilants. `ms` gives the mid the full SABLE treatment and the side WSOLA on the same time map and grain positions, ducked by `--side-duck-db` (default −6) inside the mid's resynthesized sibilants and burst cores. See [COMPROMISES §8](docs/COMPROMISES.md) before using `ms` on panned or spaced-microphone material. |
 | `--skip-leading-silence` | drop silence before the first sound, keeping a 20 ms pre-roll (`--silence-threshold-db`, default −50 dBFS RMS on the loudest channel; `--silence-preroll-ms`). The exact output length then applies to the **trimmed** input, and the skipped frame count is printed and stored under `input` in the diagnostics JSON. |
+| `--skip-trailing-silence` | the same after the last sound, keeping a 50 ms post-roll (`--silence-postroll-ms`). Combine both with `--duration` so the target applies to the speech, not the room tone around it. |
 | `--generic` | uniform generic WSOLA with all speech handling off (comparison baseline) |
 | `--pitch ST` | shift the pitch by `ST` semitones (−24…24, fractional allowed) without changing the duration set by `--stretch`. Use `--stretch 1` for a pure pitch shift. See [ALGORITHM §10a](docs/ALGORITHM.md). |
 | `--formants preserve\|shift` | with `--pitch`: keep the spectral envelope (default, same voice) or move it with the pitch (tape-speed character) |
@@ -101,10 +106,12 @@ cargo run --release -p sable-cli --features gui --bin sable-gui -- speech.wav 3/
 ```
 
 * Open any supported audio file (button or drag-and-drop). MP3/AAC files show a
-  padding note. "Skip leading silence" (with a threshold) trims the start before
-  processing, and the skipped region is shaded in the original lane. The analyzer runs in the background, and event
+  padding note. "Skip leading silence" and "Skip trailing silence" (with a threshold)
+  trim the ends before processing, and the skipped regions are shaded in the original lane. The analyzer runs in the background, and event
   classes are shown as coloured bands over the waveform.
-* Set the factor (`p/q` or decimal, with presets), seed, quality, and which renderers are
+* Set the factor (`p/q` or decimal, with presets), or switch to **Target duration**
+  and type the output length (`15`, `0:29.5`, `1500ms`, `720000f`) as **Exact** or
+  **At most**; the panel shows the (trimmed) input length and the resulting factor. Also set the seed, quality, and which renderers are
   enabled, or pick generic WSOLA for comparison. Processing runs on a worker thread.
   With **Auto** on (the default), any settings change reprocesses after a 300 ms pause in
   editing. If the result is playing, playback continues in the new result at the same

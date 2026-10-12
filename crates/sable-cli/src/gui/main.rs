@@ -1,7 +1,7 @@
 //! `sable-gui`: desktop front end for SABLE (build with `--features gui`).
 //!
-//! Open a WAV, inspect the detected acoustic events, stretch it with any exact ratio and
-//! optionally shift its pitch (with or without formants), follow the render phase by
+//! Open a WAV, inspect the detected acoustic events, stretch it with any exact ratio or to
+//! an exact target duration, optionally shift its pitch (with or without formants), follow the render phase by
 //! phase, compare original and result (waveforms, event bands, renderer masks,
 //! playback), and save audio, diagnostics and intermediate layers.
 
@@ -18,14 +18,14 @@ use std::sync::mpsc::{Receiver, channel};
 use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Color32, RichText};
-use sable_cli::trim::{SilenceTrim, leading_silence_frames, skip_frames};
+use sable_cli::trim::{SilenceTrim, Trimmed, silence_to_trim, trim_frames};
 use sable_cli::wav::{Format, write_wav};
 use sable_cli::{may_have_encoder_padding, read_audio, supported_extensions};
 use sable_core::detect::BurstCandidate;
 use sable_core::segments::{EventKind, Segment};
 use sable_core::{
-    AudioBuffer, AudioView, Options, ProcessResult, QualityPreset, StretchRatio, analyze_events,
-    stretch_with_progress,
+    AudioBuffer, AudioView, Options, ProcessResult, QualityPreset, StretchRatio, TargetDuration,
+    TargetMode, analyze_events, stretch_with_progress,
 };
 use sable_core::{FormantMode, MAX_PITCH_SEMITONES, Phase, ProgressEvent, StereoMode};
 
@@ -66,15 +66,28 @@ struct Loaded {
     bursts: Vec<BurstCandidate>,
 }
 
+/// How the output length is specified.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LengthMode {
+    /// A stretch factor (`ratio_text`).
+    Factor,
+    /// A target duration (`duration_text`), exact or as a maximum.
+    Duration,
+}
+
 #[derive(Clone, PartialEq)]
 struct Settings {
+    length_mode: LengthMode,
     ratio_text: String,
+    duration_text: String,
+    duration_mode: TargetMode,
     seed: u64,
     quality: QualityPreset,
     plosive: bool,
     sibilant: bool,
     generic: bool,
-    skip_silence: bool,
+    skip_leading: bool,
+    skip_trailing: bool,
     silence_db: f64,
     mid_side: bool,
     side_duck_db: f64,
@@ -83,6 +96,15 @@ struct Settings {
 }
 
 impl Settings {
+    fn silence_trim(&self) -> SilenceTrim {
+        SilenceTrim {
+            leading: self.skip_leading,
+            trailing: self.skip_trailing,
+            threshold_db: self.silence_db,
+            ..SilenceTrim::default()
+        }
+    }
+
     fn options(&self) -> Options {
         let mut o = if self.generic {
             Options::generic_wsola()
@@ -203,8 +225,8 @@ struct Done {
     audio: Arc<AudioBuffer>,
     settings: Settings,
     elapsed: Duration,
-    /// Leading input frames dropped before stretching (skip-silence option).
-    skipped: usize,
+    /// Input frames dropped at each end before stretching (skip-silence options).
+    trimmed: Trimmed,
     /// Phase timings of the run that produced this result.
     log: ProcessLog,
 }
@@ -241,6 +263,9 @@ struct App {
     changed_at: Option<Instant>,
     /// Settings whose processing failed (not retried automatically).
     failed_settings: Option<Settings>,
+    /// Silence trimmed from the loaded input under the current trim settings, cached
+    /// with those settings so the duration readout does not rescan every frame.
+    trim_cache: Option<(SilenceTrim, Trimmed)>,
 }
 
 impl App {
@@ -254,13 +279,17 @@ impl App {
         let mut app = Self {
             input: None,
             settings: Settings {
+                length_mode: LengthMode::Factor,
                 ratio_text: "1.5".into(),
+                duration_text: String::new(),
+                duration_mode: TargetMode::Exact,
                 seed: Options::default().seed,
                 quality: QualityPreset::Standard,
                 plosive: true,
                 sibilant: true,
                 generic: false,
-                skip_silence: false,
+                skip_leading: false,
+                skip_trailing: false,
                 silence_db: SilenceTrim::default().threshold_db,
                 mid_side: false,
                 side_duck_db: Options::default().side_duck_db,
@@ -281,13 +310,17 @@ impl App {
             show_masks: true,
             auto_process: true,
             last_settings: Settings {
+                length_mode: LengthMode::Factor,
                 ratio_text: String::new(),
+                duration_text: String::new(),
+                duration_mode: TargetMode::Exact,
                 seed: 0,
                 quality: QualityPreset::Standard,
                 plosive: true,
                 sibilant: true,
                 generic: false,
-                skip_silence: false,
+                skip_leading: false,
+                skip_trailing: false,
                 silence_db: 0.0,
                 mid_side: false,
                 side_duck_db: 0.0,
@@ -296,6 +329,7 @@ impl App {
             },
             changed_at: None,
             failed_settings: None,
+            trim_cache: None,
         };
         app.last_settings = app.settings.clone();
         if let Some(p) = initial {
@@ -323,6 +357,7 @@ impl App {
                 self.selected = None;
                 self.done = None;
                 self.error = None;
+                self.trim_cache = None;
                 self.status = format!("Loaded {}", path.display());
                 let (tx, rx) = channel();
                 let a = audio.clone();
@@ -351,14 +386,50 @@ impl App {
         }
     }
 
-    fn ratio(&self) -> Result<StretchRatio, String> {
-        StretchRatio::parse(self.settings.ratio_text.trim()).map_err(|e| e.to_string())
+    /// Silence the current settings trim from the loaded input (recomputed only when
+    /// the trim settings or the file change).
+    fn trimmed(&mut self) -> Trimmed {
+        let Some(input) = &self.input else {
+            return Trimmed::default();
+        };
+        let cfg = self.settings.silence_trim();
+        match self.trim_cache {
+            Some((c, t)) if c == cfg => t,
+            _ => {
+                let t = silence_to_trim(&input.audio, &cfg);
+                self.trim_cache = Some((cfg, t));
+                t
+            }
+        }
+    }
+
+    /// Frames that will be stretched: the input minus trimmed silence.
+    fn frames_to_process(&mut self) -> Option<u64> {
+        let t = self.trimmed();
+        let n = self.input.as_ref()?.audio.frames();
+        Some(n.saturating_sub(t.leading + t.trailing) as u64)
+    }
+
+    fn ratio(&mut self) -> Result<StretchRatio, String> {
+        match self.settings.length_mode {
+            LengthMode::Factor => {
+                StretchRatio::parse(self.settings.ratio_text.trim()).map_err(|e| e.to_string())
+            }
+            LengthMode::Duration => {
+                let d = TargetDuration::parse(&self.settings.duration_text)
+                    .map_err(|e| e.to_string())?;
+                let n_in = self.frames_to_process().ok_or("open a file first")?;
+                let fs = self.input.as_ref().map_or(48_000, |i| i.audio.sample_rate);
+                d.ratio(n_in, fs, self.settings.duration_mode)
+                    .map_err(|e| e.to_string())
+            }
+        }
     }
 
     fn process(&mut self, ctx: &egui::Context) {
-        let (Some(input), Ok(ratio)) = (&self.input, self.ratio()) else {
-            return;
-        };
+        let Ok(ratio) = self.ratio() else { return };
+        let trimmed = self.trimmed();
+        let Some(input) = &self.input else { return };
         let full = input.audio.clone();
         let settings = self.settings.clone();
         let (tx, rx) = channel();
@@ -366,17 +437,8 @@ impl App {
         let ctx2 = ctx.clone();
         std::thread::spawn(move || {
             let t = Instant::now();
-            let skipped = if settings.skip_silence {
-                let cfg = SilenceTrim {
-                    threshold_db: settings.silence_db,
-                    ..SilenceTrim::default()
-                };
-                leading_silence_frames(&full, &cfg)
-            } else {
-                0
-            };
-            let audio = if skipped > 0 {
-                Arc::new(skip_frames(&full, skipped))
+            let audio = if trimmed != Trimmed::default() {
+                Arc::new(trim_frames(&full, trimmed))
             } else {
                 full
             };
@@ -396,7 +458,7 @@ impl App {
                     result: Arc::new(result),
                     settings,
                     elapsed: t.elapsed(),
-                    skipped,
+                    trimmed,
                     log: ProcessLog::default(),
                 })
                 .map_err(|e| e.to_string());
@@ -537,7 +599,7 @@ impl App {
     /// Piecewise-linear input→output frame map from the report's segment table.
     fn in_to_out(&self, x: f64) -> f64 {
         let Some(d) = &self.done else { return x };
-        let x = x - d.skipped as f64;
+        let x = x - d.trimmed.leading as f64;
         let segs = &d.result.report.segments;
         for s in segs {
             let (a, l) = (s.in_start as f64, s.in_len as f64);
@@ -556,10 +618,10 @@ impl App {
             let (o, d_) = (s.out_start as f64, s.out_len as f64);
             if y < o + d_ || std::ptr::eq(s, segs.last().unwrap()) {
                 let v = (y - o) / d_.max(1.0);
-                return d.skipped as f64 + s.in_start as f64 + v * s.in_len as f64;
+                return d.trimmed.leading as f64 + s.in_start as f64 + v * s.in_len as f64;
             }
         }
-        y + d.skipped as f64
+        y + d.trimmed.leading as f64
     }
 
     fn input_segments(&self) -> Option<Vec<SegRow>> {
@@ -570,7 +632,7 @@ impl App {
                     .segments
                     .iter()
                     .map(|s| {
-                        let off = d.skipped as u64;
+                        let off = d.trimmed.leading as u64;
                         (
                             off + s.in_start,
                             off + s.in_start + s.in_len,
@@ -660,6 +722,86 @@ impl App {
         });
     }
 
+    /// Stretch-factor field with presets; returns the text field's response.
+    fn factor_input(&mut self, ui: &mut egui::Ui) -> egui::Response {
+        ui.label(
+            RichText::new("factor = duration out / duration in")
+                .weak()
+                .small(),
+        );
+        let resp = ui.add(
+            egui::TextEdit::singleline(&mut self.settings.ratio_text)
+                .hint_text("3/2 or 1.25")
+                .desired_width(f32::INFINITY),
+        );
+        ui.horizontal_wrapped(|ui| {
+            for p in ["0.5", "0.65", "0.75", "0.9", "1.25", "1.5", "1.8", "2"] {
+                if ui
+                    .selectable_label(self.settings.ratio_text == p, p)
+                    .clicked()
+                {
+                    self.settings.ratio_text = p.into();
+                }
+            }
+        });
+        resp
+    }
+
+    /// Target-duration field (exact or maximum) with the length it applies to;
+    /// returns the text field's response.
+    fn duration_input(&mut self, ui: &mut egui::Ui) -> egui::Response {
+        let fs = self.input.as_ref().map(|i| i.audio.sample_rate);
+        let n_in = self.frames_to_process();
+        match (n_in, fs) {
+            (Some(n), Some(fs)) => {
+                let trimmed = self.settings.skip_leading || self.settings.skip_trailing;
+                ui.label(
+                    RichText::new(format!(
+                        "{} {:.3} s",
+                        if trimmed { "trimmed input" } else { "input" },
+                        n as f64 / fs as f64
+                    ))
+                    .weak()
+                    .small(),
+                );
+            }
+            _ => {
+                ui.label(
+                    RichText::new("open a file to see its length")
+                        .weak()
+                        .small(),
+                );
+            }
+        }
+        let resp = ui.add(
+            egui::TextEdit::singleline(&mut self.settings.duration_text)
+                .hint_text("15, 29.5s, 0:29.5, 1500ms, 720000f")
+                .desired_width(f32::INFINITY),
+        );
+        ui.horizontal_wrapped(|ui| {
+            for p in ["5", "10", "15", "20", "30", "45", "60"] {
+                let label = format!("{p} s");
+                if ui
+                    .selectable_label(self.settings.duration_text == p, label)
+                    .clicked()
+                {
+                    self.settings.duration_text = p.into();
+                }
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.radio_value(&mut self.settings.duration_mode, TargetMode::Exact, "Exact")
+                .on_hover_text("Output is exactly this long; shorter reads are lengthened.");
+            ui.radio_value(
+                &mut self.settings.duration_mode,
+                TargetMode::AtMost,
+                "At most",
+            )
+            .on_hover_text("Only shorten: a read already within the duration is left as is.");
+        });
+        resp
+    }
+
     fn side_panel(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         egui::ScrollArea::vertical().show(ui, |ui| {
@@ -667,29 +809,24 @@ impl App {
                 emoji_label(ui, "⏱️");
                 ui.heading("Stretch");
             });
-            ui.label(
-                RichText::new("factor = duration out / duration in")
-                    .weak()
-                    .small(),
-            );
-            let resp = ui.add(
-                egui::TextEdit::singleline(&mut self.settings.ratio_text)
-                    .hint_text("3/2 or 1.25")
-                    .desired_width(f32::INFINITY),
-            );
-            ui.horizontal_wrapped(|ui| {
-                for p in ["0.5", "0.65", "0.75", "0.9", "1.25", "1.5", "1.8", "2"] {
-                    if ui
-                        .selectable_label(self.settings.ratio_text == p, p)
-                        .clicked()
-                    {
-                        self.settings.ratio_text = p.into();
-                    }
-                }
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut self.settings.length_mode, LengthMode::Factor, "Factor");
+                ui.selectable_value(
+                    &mut self.settings.length_mode,
+                    LengthMode::Duration,
+                    "Target duration",
+                )
+                .on_hover_text(
+                    "Give the output length directly, e.g. to fit a disclaimer read into a slot.",
+                );
             });
+            let resp = match self.settings.length_mode {
+                LengthMode::Factor => self.factor_input(ui),
+                LengthMode::Duration => self.duration_input(ui),
+            };
             match self.ratio() {
                 Ok(r) => {
-                    let n_in = self.input.as_ref().map_or(0, |i| i.audio.frames() as u64);
+                    let n_in = self.frames_to_process().unwrap_or(0);
                     let target = r
                         .target_frames(n_in)
                         .map_or("overflow".into(), |t| t.to_string());
@@ -813,11 +950,17 @@ impl App {
                     });
                 });
             });
-            ui.checkbox(&mut self.settings.skip_silence, "Skip leading silence")
+            ui.checkbox(&mut self.settings.skip_leading, "Skip leading silence")
                 .on_hover_text(
-                    "Drop silence before the first sound (keeping 20 ms) before stretching.                      The exact output length then applies to the trimmed input.",
+                    "Drop silence before the first sound (keeping 20 ms) before stretching. \
+                     The exact output length then applies to the trimmed input.",
                 );
-            ui.add_enabled_ui(self.settings.skip_silence, |ui| {
+            ui.checkbox(&mut self.settings.skip_trailing, "Skip trailing silence")
+                .on_hover_text(
+                    "Drop silence after the last sound (keeping 50 ms) before stretching. \
+                     The exact output length then applies to the trimmed input.",
+                );
+            ui.add_enabled_ui(self.settings.skip_leading || self.settings.skip_trailing, |ui| {
                 ui.horizontal(|ui| {
                     ui.label("Threshold");
                     ui.add(
@@ -1138,6 +1281,17 @@ impl App {
             avail - 4.0
         };
 
+        let shade: Vec<(f64, f64)> = self
+            .done
+            .as_ref()
+            .map(|d| {
+                let t = d.trimmed;
+                [(0.0, t.leading as f64), (n_in - t.trailing as f64, n_in)]
+                    .into_iter()
+                    .filter(|(a, b)| b > a)
+                    .collect()
+            })
+            .unwrap_or_default();
         let in_resp = Lane {
             title: "Original",
             channels: &audio.channels,
@@ -1147,11 +1301,7 @@ impl App {
             masks: None,
             playhead: playing.filter(|p| p.0 == Source::Original).map(|p| p.1),
             cursor: Some(self.cursor),
-            shade: self
-                .done
-                .as_ref()
-                .filter(|d| d.skipped > 0)
-                .map(|d| (0.0, d.skipped as f64)),
+            shade: &shade,
             dim: false,
         }
         .show(ui, lane_h);
@@ -1204,7 +1354,7 @@ impl App {
                 masks,
                 playhead: playing.filter(|p| p.0 == Source::Result).map(|p| p.1),
                 cursor: Some(self.in_to_out(self.cursor)),
-                shade: None,
+                shade: &[],
                 dim: false,
             }
             .show(ui, lane_h);
@@ -1451,16 +1601,26 @@ impl App {
                                 ui.end_row();
                             }
                         }
+                        let ms = |f: usize| f as f64 * 1000.0 / r.sample_rate as f64;
                         ui.label("skipped silence");
-                        ui.label(if d.skipped > 0 {
-                            format!(
-                                "{} frames ({:.1} ms)",
-                                d.skipped,
-                                d.skipped as f64 * 1000.0 / r.sample_rate as f64
-                            )
-                        } else {
+                        ui.label(if d.trimmed == Trimmed::default() {
                             "none".into()
+                        } else {
+                            format!(
+                                "{} leading ({:.1} ms), {} trailing ({:.1} ms)",
+                                d.trimmed.leading,
+                                ms(d.trimmed.leading),
+                                d.trimmed.trailing,
+                                ms(d.trimmed.trailing)
+                            )
                         });
+                        ui.end_row();
+                        ui.label("duration");
+                        ui.label(format!(
+                            "{:.3} s → {:.3} s",
+                            r.n_in as f64 / r.sample_rate as f64,
+                            r.n_out as f64 / r.sample_rate as f64
+                        ));
                         ui.end_row();
                         ui.label("time");
                         ui.label(format!("{:.0} ms", d.elapsed.as_secs_f64() * 1000.0));

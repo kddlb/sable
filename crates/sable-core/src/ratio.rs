@@ -51,6 +51,12 @@ impl StretchRatio {
         })
     }
 
+    /// The ratio `n_out / n_in`, which maps `n_in` frames to exactly `n_out` frames
+    /// (`floor(n_in · n_out / n_in + 1/2) = n_out`). Both counts must be positive.
+    pub fn for_frames(n_in: u64, n_out: u64) -> Result<Self, StretchError> {
+        Self::new(n_out, n_in)
+    }
+
     /// Parses `"p/q"` with positive integer parts.
     pub fn from_fraction_str(s: &str) -> Result<Self, StretchError> {
         let bad = || StretchError::MalformedRatio(s.to_string());

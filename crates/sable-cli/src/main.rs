@@ -5,13 +5,13 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use clap::{Parser, ValueEnum};
+use clap::{ArgGroup, Parser, ValueEnum};
 use sable_cli::trim::SilenceTrim;
 use sable_cli::wav::{Format, write_wav};
 use sable_cli::{load_input, may_have_encoder_padding, supported_extensions};
 use sable_core::{
     AudioView, FormantMode, Options, ProgressEvent, QualityPreset, StereoMode, StretchRatio,
-    stretch_with_progress,
+    TargetDuration, TargetMode, stretch_with_progress,
 };
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -40,6 +40,7 @@ enum Quality {
 /// Speech time stretcher and pitch shifter with sample-exact output length.
 #[derive(Parser, Debug)]
 #[command(name = "sable", version)]
+#[command(group(ArgGroup::new("length").required(true).args(["stretch", "duration", "max_duration"])))]
 struct Cli {
     /// Input audio file, mono or stereo: WAV (integer/float PCM) and, with the default
     /// `decode` feature, FLAC, MP3, Ogg Vorbis, M4A/MP4 (AAC, ALAC), AIFF, CAF, MKV/WebM.
@@ -51,7 +52,16 @@ struct Cli {
     /// Stretch factor = duration_out / duration_in, as "p/q" or a decimal ("1.25").
     /// Use 1 to only shift the pitch.
     #[arg(long, short)]
-    stretch: String,
+    stretch: Option<String>,
+    /// Exact output duration instead of a factor: seconds ("29.5", "29.5s"), "1500ms",
+    /// clock time ("0:29.5", "1:02.250") or frames ("720000f"). Applies to the input
+    /// after any silence trimming.
+    #[arg(long, short)]
+    duration: Option<String>,
+    /// Like --duration, but only shortens: an input already within this duration is
+    /// left at its own length (factor 1).
+    #[arg(long)]
+    max_duration: Option<String>,
     /// Pitch shift in semitones (-24..=24, fractional allowed). Duration is still set by
     /// --stretch alone.
     #[arg(long, default_value_t = 0.0, allow_negative_numbers = true)]
@@ -98,12 +108,19 @@ struct Cli {
     /// The exact output length then applies to the trimmed input.
     #[arg(long)]
     skip_leading_silence: bool,
-    /// Level (dBFS RMS, loudest channel) treated as sound by --skip-leading-silence.
+    /// Drop trailing silence from the input before stretching (keeps a short post-roll).
+    /// The exact output length then applies to the trimmed input.
+    #[arg(long)]
+    skip_trailing_silence: bool,
+    /// Level (dBFS RMS, loudest channel) treated as sound by --skip-*-silence.
     #[arg(long, default_value_t = SilenceTrim::default().threshold_db, allow_negative_numbers = true)]
     silence_threshold_db: f64,
     /// Audio kept before the first sound by --skip-leading-silence, in milliseconds.
     #[arg(long, default_value_t = SilenceTrim::default().preroll_ms)]
     silence_preroll_ms: f64,
+    /// Audio kept after the last sound by --skip-trailing-silence, in milliseconds.
+    #[arg(long, default_value_t = SilenceTrim::default().postroll_ms)]
+    silence_postroll_ms: f64,
 }
 
 fn main() -> ExitCode {
@@ -117,13 +134,31 @@ fn main() -> ExitCode {
 }
 
 fn run(cli: Cli) -> Result<(), String> {
-    let ratio = StretchRatio::parse(&cli.stretch).map_err(|e| e.to_string())?;
-    let trim = cli.skip_leading_silence.then(|| SilenceTrim {
+    // Parse the length request before decoding, so typos fail fast.
+    let target = match (&cli.duration, &cli.max_duration) {
+        (Some(d), _) => Some((TargetDuration::parse(d), TargetMode::Exact)),
+        (_, Some(d)) => Some((TargetDuration::parse(d), TargetMode::AtMost)),
+        _ => None,
+    }
+    .map(|(d, m)| d.map(|d| (d, m)))
+    .transpose()
+    .map_err(|e| e.to_string())?;
+    let fixed_ratio = cli
+        .stretch
+        .as_deref()
+        .map(StretchRatio::parse)
+        .transpose()
+        .map_err(|e| e.to_string())?;
+    let trimming = cli.skip_leading_silence || cli.skip_trailing_silence;
+    let trim = trimming.then(|| SilenceTrim {
+        leading: cli.skip_leading_silence,
+        trailing: cli.skip_trailing_silence,
         threshold_db: cli.silence_threshold_db,
         preroll_ms: cli.silence_preroll_ms.max(0.0),
+        postroll_ms: cli.silence_postroll_ms.max(0.0),
         ..SilenceTrim::default()
     });
-    let (input, skipped) = load_input(&cli.input, trim.as_ref()).map_err(|e| {
+    let (input, trimmed) = load_input(&cli.input, trim.as_ref()).map_err(|e| {
         format!(
             "{e}
 (supported extensions: {})",
@@ -161,6 +196,14 @@ fn run(cli: Cli) -> Result<(), String> {
         Formants::Shift => FormantMode::Shift,
     };
 
+    let ratio = match (fixed_ratio, target) {
+        (Some(r), _) => r,
+        (None, Some((d, mode))) => d
+            .ratio(input.frames() as u64, input.sample_rate, mode)
+            .map_err(|e| e.to_string())?,
+        (None, None) => unreachable!("clap requires one of --stretch/--duration/--max-duration"),
+    };
+
     let refs = input.view_refs();
     let view = AudioView {
         sample_rate: input.sample_rate,
@@ -185,10 +228,38 @@ fn run(cli: Cli) -> Result<(), String> {
         "sample rate    {} Hz, {} channel(s)",
         r.sample_rate, r.channels
     );
+    let ms = |f: usize| f as f64 * 1000.0 / r.sample_rate as f64;
     if cli.skip_leading_silence {
         println!(
-            "skipped        {skipped} leading frames ({:.1} ms of silence)",
-            skipped as f64 * 1000.0 / r.sample_rate as f64
+            "skipped        {} leading frames ({:.1} ms of silence)",
+            trimmed.leading,
+            ms(trimmed.leading)
+        );
+    }
+    if cli.skip_trailing_silence {
+        println!(
+            "skipped        {} trailing frames ({:.1} ms of silence)",
+            trimmed.trailing,
+            ms(trimmed.trailing)
+        );
+    }
+    if let Some((d, mode)) = &target {
+        let secs = |f: u64| f as f64 / r.sample_rate as f64;
+        let frames = match d {
+            TargetDuration::Frames(_) => String::new(),
+            TargetDuration::Seconds { .. } => format!(
+                " = {} frames",
+                d.frames(r.sample_rate).map_err(|e| e.to_string())?
+            ),
+        };
+        println!(
+            "target         {}{d}{frames}; input {:.3} s -> output {:.3} s",
+            match mode {
+                TargetMode::Exact => "",
+                TargetMode::AtMost => "at most ",
+            },
+            secs(r.n_in),
+            secs(r.n_out),
         );
     }
     if let Some(p) = &r.pitch {
@@ -231,9 +302,17 @@ fn run(cli: Cli) -> Result<(), String> {
                 serde_json::json!({
                     "path": cli.input.display().to_string(),
                     "skip_leading_silence": cli.skip_leading_silence,
-                    "skipped_leading_frames": skipped,
+                    "skipped_leading_frames": trimmed.leading,
+                    "skip_trailing_silence": cli.skip_trailing_silence,
+                    "skipped_trailing_frames": trimmed.trailing,
                     "silence_threshold_db": cli.silence_threshold_db,
                     "silence_preroll_ms": cli.silence_preroll_ms,
+                    "silence_postroll_ms": cli.silence_postroll_ms,
+                    "target_duration": target.map(|(d, mode)| serde_json::json!({
+                        "duration": d,
+                        "mode": mode,
+                        "frames": d.frames(r.sample_rate).ok(),
+                    })),
                 }),
             );
         }

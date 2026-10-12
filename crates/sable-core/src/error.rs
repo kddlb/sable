@@ -12,6 +12,8 @@ pub enum StretchError {
     ZeroRatio,
     #[error("malformed stretch ratio {0:?}")]
     MalformedRatio(String),
+    #[error("malformed or unusable target duration {0:?}")]
+    MalformedDuration(String),
     #[error("unsupported sample rate {0} Hz (supported: 8000..=96000)")]
     UnsupportedSampleRate(u32),
     #[error("unsupported channel count {0} (supported: 1 or 2)")]
