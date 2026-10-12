@@ -246,8 +246,10 @@ pub fn stop_fixture(fs: u32, seed: u64) -> Fixture {
     pos += parts[3];
     let asp = shaped_noise(fs, parts[4], seed ^ 3, |f| band(f, 1000.0, 6000.0, 800.0));
     let na = parts[4];
-    add_at(&mut x, pos - ms(1.0), &asp, 0.05, |i| {
-        (-(i as f64) / (na as f64 * 0.5)).exp()
+    let rise = ms(2.0) as f64;
+    add_at(&mut x, pos - ms(1.0), &asp, 0.035, |i| {
+        let a = (i as f64 / rise).min(1.0);
+        a * a * (-(i as f64) / (na as f64 * 0.5)).exp()
     });
     pos += parts[4];
     let v2 = vowel(fs, parts[5], 120.0, E_FORM, A_FORM, 0.3);
@@ -440,8 +442,10 @@ pub fn sibilant_stop_fixture(fs: u32, seed: u64) -> Fixture {
     pos += parts[3];
     let na = parts[4];
     let asp = shaped_noise(fs, na, seed ^ 34, |f| band(f, 1000.0, 6000.0, 800.0));
-    add_at(&mut x, pos - ms(1.0), &asp, 0.05, |i| {
-        (-(i as f64) / (na as f64 * 0.5)).exp()
+    let rise = ms(2.0) as f64;
+    add_at(&mut x, pos - ms(1.0), &asp, 0.035, |i| {
+        let a = (i as f64 / rise).min(1.0);
+        a * a * (-(i as f64) / (na as f64 * 0.5)).exp()
     });
     pos += parts[4];
     add_at(
