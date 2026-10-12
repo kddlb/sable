@@ -100,3 +100,40 @@ fn level_is_preserved_on_steady_vowel() {
         assert!(db.abs() < 1.0, "r={f}: level change {db:.2} dB");
     }
 }
+
+#[test]
+fn period_blend_is_opt_in_and_keeps_length_and_level() {
+    let fx = synth::utterance_fixture(48_000, 1);
+    let refs = fx.audio.view_refs();
+    let view = AudioView {
+        sample_rate: 48_000,
+        channels: &refs,
+    };
+    for f in ["1.5", "3"] {
+        let r = StretchRatio::parse(f).unwrap();
+        let plain = stretch(&view, r, &Options::default()).unwrap();
+        let blend = stretch(
+            &view,
+            r,
+            &Options {
+                period_blend: true,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+        let n = r.target_frames(fx.audio.frames() as u64).unwrap() as usize;
+        assert_eq!(blend.audio.channels[0].len(), n);
+        assert!(blend.audio.channels[0].iter().all(|v| v.is_finite()));
+        let blended = blend.report.wsola.as_ref().unwrap().blended_grains;
+        let level = |x: &[f32]| x.iter().map(|&v| (v as f64).powi(2)).sum::<f64>();
+        let db = 10.0 * (level(&blend.audio.channels[0]) / level(&plain.audio.channels[0])).log10();
+        assert!(db.abs() < 1.0, "{f}: level changed by {db:.2} dB");
+        if f == "3" {
+            assert!(blended > 0, "no grain blended at 3x");
+        } else {
+            // Global 1.5x stays below the 1.8x gate except where the budget stretches
+            // single segments harder; never more than a minority of grains.
+            assert!(blended * 2 < blend.report.wsola.as_ref().unwrap().grains);
+        }
+    }
+}

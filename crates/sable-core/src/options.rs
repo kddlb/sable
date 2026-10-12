@@ -60,6 +60,10 @@ pub struct Options {
     pub pitch_semitones: f64,
     /// Envelope handling for a nonzero `pitch_semitones`.
     pub formants: FormantMode,
+    /// Experimental: where the local slow-down is strong (≥ 1.8×), render voiced grains
+    /// as a blend of the two aligned pitch periods around the predicted source position
+    /// instead of repeating one period and jumping. Off by default.
+    pub period_blend: bool,
     /// Worker threads for the parallel stages (`0` = all cores, `1` = calling thread
     /// only). The output is bit-identical for every setting.
     #[serde(skip)]
@@ -81,6 +85,7 @@ impl Default for Options {
             side_duck_db: -6.0,
             pitch_semitones: 0.0,
             formants: FormantMode::Preserve,
+            period_blend: false,
             threads: 0,
         }
     }

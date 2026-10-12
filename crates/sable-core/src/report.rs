@@ -83,6 +83,14 @@ pub struct WsolaStats {
     pub predicted_only: u64,
     pub mean_abs_offset: f64,
     pub uncovered_filled: u64,
+    /// Grains rendered as a blend of two neighbouring pitch periods
+    /// ([`crate::Options::period_blend`]).
+    #[serde(skip_serializing_if = "is_zero")]
+    pub blended_grains: u64,
+}
+
+fn is_zero(v: &u64) -> bool {
+    *v == 0
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]

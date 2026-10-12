@@ -208,3 +208,60 @@ pub fn release_peaks(
     }
     (count, main_i)
 }
+
+/// Period-to-period similarity profile, for spotting "repeat and jump" artefacts of
+/// strong slow-downs.
+///
+/// Every 2.5 ms the local pitch period `T` is taken as the autocorrelation peak over a
+/// 30 ms window (lags for 60–400 Hz); frames whose peak is at least 0.5 and whose level is
+/// within 40 dB of the loudest frame count as voiced. For those, the normalized
+/// correlation of the two consecutive periods `x[t..t+T]` and `x[t+T..t+2T]` is returned.
+/// Natural speech changes a little every period. Repeated periods score ≈ 1 and the
+/// jumps between repeats score lower, so repeat-and-jump output swings more from frame
+/// to frame. A smooth period-to-period morph also scores ≈ 1, though, so this cannot tell
+/// a morph from a verbatim repeat.
+pub fn period_similarity(x: &[f32], fs: u32) -> Vec<f64> {
+    let hop = (fs as usize / 400).max(1);
+    let win = (fs as usize * 3 / 100).max(4);
+    let (lo, hi) = ((fs as usize / 400).max(2), fs as usize / 60);
+    let level = |t: usize| rms(x, t, t + win);
+    let mut loudest = 0f64;
+    let mut t = 0;
+    while t + win + 2 * hi < x.len() {
+        loudest = loudest.max(level(t));
+        t += hop;
+    }
+    let floor = loudest * 0.01; // −40 dB
+    let ncc = |a: &[f32], b: &[f32]| {
+        let (mut n, mut ea, mut eb) = (0f64, 0f64, 0f64);
+        for (&u, &v) in a.iter().zip(b) {
+            let (u, v) = (u as f64, v as f64);
+            n += u * v;
+            ea += u * u;
+            eb += v * v;
+        }
+        if ea > 0.0 && eb > 0.0 {
+            n / (ea * eb).sqrt()
+        } else {
+            0.0
+        }
+    };
+    let mut out = Vec::new();
+    let mut t = 0;
+    while t + win + 2 * hi < x.len() {
+        if level(t) >= floor && loudest > 0.0 {
+            let (mut best, mut period) = (0f64, 0usize);
+            for lag in lo..=hi {
+                let r = ncc(&x[t..t + win], &x[t + lag..t + lag + win]);
+                if r > best {
+                    (best, period) = (r, lag);
+                }
+            }
+            if best >= 0.5 {
+                out.push(ncc(&x[t..t + period], &x[t + period..t + 2 * period]));
+            }
+        }
+        t += hop;
+    }
+    out
+}

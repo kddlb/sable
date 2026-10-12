@@ -93,6 +93,7 @@ struct Settings {
     side_duck_db: f64,
     pitch_semitones: f64,
     formants: FormantMode,
+    period_blend: bool,
 }
 
 impl Settings {
@@ -122,6 +123,7 @@ impl Settings {
         o.side_duck_db = self.side_duck_db.min(0.0);
         o.pitch_semitones = self.pitch_semitones;
         o.formants = self.formants;
+        o.period_blend = self.period_blend;
         o
     }
 }
@@ -295,6 +297,7 @@ impl App {
                 side_duck_db: Options::default().side_duck_db,
                 pitch_semitones: 0.0,
                 formants: FormantMode::Preserve,
+                period_blend: false,
             },
             format: Format::Float32,
             analyze_rx: None,
@@ -326,6 +329,7 @@ impl App {
                 side_duck_db: 0.0,
                 pitch_semitones: 0.0,
                 formants: FormantMode::Preserve,
+                period_blend: false,
             },
             changed_at: None,
             failed_settings: None,
@@ -921,6 +925,10 @@ impl App {
                 ui.checkbox(&mut self.settings.plosive, "Protect plosive bursts");
                 ui.checkbox(&mut self.settings.sibilant, "Resynthesize sibilants");
             });
+            ui.checkbox(&mut self.settings.period_blend, "Blend pitch periods (experimental)")
+                .on_hover_text(
+                    "Where the local slow-down is 1.8× or more, mix the two aligned pitch                      periods around each grain's source position instead of repeating one                      period and skipping ahead. Affects voiced sounds only.",
+                );
             let stereo = self.input.as_ref().is_some_and(|i| i.audio.channels.len() == 2);
             ui.add_enabled_ui(stereo, |ui| {
                 ui.horizontal(|ui| {

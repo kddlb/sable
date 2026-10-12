@@ -348,7 +348,10 @@ pub fn render(
             len: plan.segments[i].len(),
         })
         .collect();
-    let cfg = WsolaConfig::new(fs, opts.quality);
+    let mut cfg = WsolaConfig::new(fs, opts.quality);
+    if opts.period_blend {
+        cfg.blend = Some(wsola::BlendConfig::new(fs));
+    }
     progress.start(Phase::Wsola);
     let base = wsola::render(
         work.channels,
@@ -361,8 +364,14 @@ pub fn render(
     progress.finish(
         Phase::Wsola,
         format!(
-            "{} grains ({} transient)",
-            base.stats.grains, base.stats.transient_grains
+            "{} grains ({} transient{})",
+            base.stats.grains,
+            base.stats.transient_grains,
+            if opts.period_blend {
+                format!(", {} period-blended", base.stats.blended_grains)
+            } else {
+                String::new()
+            }
         ),
     );
     if base.stats.uncovered_filled > 0 {

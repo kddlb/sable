@@ -24,6 +24,34 @@ pub struct WsolaConfig {
     pub t_zone: usize,
     /// Coarse search decimation step (refined afterwards at full resolution).
     pub coarse_step: usize,
+    /// Pitch-period blending for strong local slow-downs (`None` = off).
+    pub blend: Option<BlendConfig>,
+}
+
+/// Settings for blending two neighbouring pitch periods (see [`render`]).
+#[derive(Clone, Debug)]
+pub struct BlendConfig {
+    /// Blend only where the local factor (output / input) is at least this.
+    pub min_ratio: f64,
+    /// Both periods must correlate at least this well with the overlap template.
+    pub min_ncc: f64,
+    /// ...and at least this well with each other (so the mix is in phase).
+    pub min_mutual: f64,
+    /// Accepted distance between the two candidates (one pitch period), in frames.
+    pub min_period: usize,
+    pub max_period: usize,
+}
+
+impl BlendConfig {
+    pub fn new(fs: u32) -> Self {
+        Self {
+            min_ratio: 1.8,
+            min_ncc: 0.5,
+            min_mutual: 0.7,
+            min_period: ms_to_samples(2.0, fs).max(2),
+            max_period: ms_to_samples(16.0, fs),
+        }
+    }
 }
 
 impl WsolaConfig {
@@ -49,6 +77,7 @@ impl WsolaConfig {
             t_search: ms_to_samples(2.0, fs),
             t_zone: ms_to_samples(20.0, fs),
             coarse_step: coarse,
+            blend: None,
         }
     }
 }
@@ -197,6 +226,152 @@ fn ncc_scores(
     }
 }
 
+/// Local factor (output / input) of the time map around output frame `y`.
+fn local_ratio(map: &TimeMap, y: i64, hop: usize) -> f64 {
+    let h = hop.max(1) as f64;
+    let dx = map.inverse(y as f64 + h) - map.inverse(y as f64 - h);
+    if dx <= 1e-9 {
+        f64::INFINITY
+    } else {
+        2.0 * h / dx
+    }
+}
+
+/// Two aligned source centres one pitch period apart, around a predicted position.
+#[derive(Clone, Copy, Debug)]
+struct Pair {
+    before: i64,
+    after: i64,
+    /// Weight of `after`: the prediction's fractional position between the two.
+    alpha: f64,
+    /// Normalized correlation of the two source grains.
+    rho: f64,
+}
+
+impl Pair {
+    /// Gain that keeps the blend's power equal to the mean power of the two grains:
+    /// `1 / sqrt((1-α)² + α² + 2α(1-α)ρ)`.
+    fn gain(&self) -> f64 {
+        let al = self.alpha;
+        let pw = (1.0 - al).powi(2) + al * al + 2.0 * al * (1.0 - al) * self.rho;
+        if pw > 1e-6 { 1.0 / pw.sqrt() } else { 1.0 }
+    }
+}
+
+/// Normalized correlation of the source grains of length `n` starting at `a` and `b`.
+fn grain_ncc(
+    p: &Padded,
+    x: &[f32],
+    a: i64,
+    b: i64,
+    n: usize,
+    ta: &mut Vec<f32>,
+    tb: &mut Vec<f32>,
+) -> f64 {
+    let u = read(p, x, a, n, ta);
+    let v = read(p, x, b, n, tb);
+    let (mut uv, mut uu, mut vv) = (0f64, 0f64, 0f64);
+    for (&u, &v) in u.iter().zip(v) {
+        let (u, v) = (u as f64, v as f64);
+        uv += u * v;
+        uu += u * u;
+        vv += v * v;
+    }
+    if uu <= 1e-30 || vv <= 1e-30 {
+        0.0
+    } else {
+        (uv / (uu * vv).sqrt()).clamp(-1.0, 1.0)
+    }
+}
+
+/// Finds two source centres one pitch period apart that bracket `pred` and are in phase
+/// with the output written so far.
+///
+/// The best match `c_star` (the plain WSOLA choice) fixes the phase. The local period `T`
+/// is the distance from `c_star` to the strongest other correlation peak between
+/// `min_period` and `max_period` away. Aligned positions then lie on the lattice
+/// `c_star + k·T`; the two lattice points around `pred` are refined at full resolution and
+/// accepted if each still correlates at least `min_ncc` with the template and the two
+/// source grains correlate at least `min_mutual` with each other.
+#[allow(clippy::too_many_arguments)]
+fn find_pair(
+    p: &Padded,
+    x: &[f32],
+    tmpl: &[f64],
+    off: i64,
+    pred: i64,
+    c_star: i64,
+    half: i64,
+    step: usize,
+    bc: &BlendConfig,
+    crosses: &dyn Fn(i64) -> bool,
+    cands: &mut Vec<i64>,
+    scores: &mut Vec<f64>,
+    tmp: (&mut Vec<f32>, &mut Vec<f32>),
+) -> Option<Pair> {
+    let energy = |step: usize| tmpl.iter().step_by(step).map(|t| t * t).sum::<f64>();
+    let (e_coarse, e1) = (energy(step), energy(1));
+    let s = step as i64;
+    let (lo_p, hi_p) = (bc.min_period as i64, bc.max_period as i64);
+    // Coarse correlation over c_star ± max_period: the strongest peak at a plausible
+    // period distance gives T.
+    cands.clear();
+    cands.extend((-hi_p..=hi_p).step_by(step).map(|d| c_star + d));
+    ncc_scores(p, x, tmpl, off, cands, step, e_coarse, scores);
+    let neighbour = (1..cands.len().saturating_sub(1))
+        .filter(|&k| scores[k] >= scores[k - 1] && scores[k] > scores[k + 1])
+        .filter(|&k| (lo_p..=hi_p).contains(&(cands[k] - c_star).abs()))
+        .max_by(|&a, &b| scores[a].total_cmp(&scores[b]))
+        .map(|k| cands[k])?;
+    let mut refine = |c0: i64| -> Option<(i64, f64)> {
+        cands.clear();
+        cands.extend((c0 - s + 1..=c0 + s - 1).filter(|&c| !crosses(c)));
+        ncc_scores(p, x, tmpl, off, cands, 1, e1, scores);
+        cands
+            .iter()
+            .zip(scores.iter())
+            .fold(None, |b: Option<(i64, f64)>, (&c, &sc)| match b {
+                Some((_, bs)) if bs >= sc => b,
+                _ => Some((c, sc)),
+            })
+    };
+    let (nb, _) = refine(neighbour)?;
+    let t = (nb - c_star).abs();
+    if t < lo_p {
+        return None;
+    }
+    let k = (pred - c_star).div_euclid(t);
+    let (before, sb) = refine(c_star + k * t)?;
+    let (after, sa) = refine(c_star + (k + 1) * t)?;
+    let period = after - before;
+    if sb < bc.min_ncc
+        || sa < bc.min_ncc
+        || !(lo_p..=hi_p).contains(&period)
+        || pred < before
+        || pred > after
+    {
+        return None;
+    }
+    let rho = grain_ncc(
+        p,
+        x,
+        before - half,
+        after - half,
+        2 * half as usize,
+        tmp.0,
+        tmp.1,
+    );
+    if rho < bc.min_mutual {
+        return None;
+    }
+    Some(Pair {
+        before,
+        after,
+        alpha: (pred - before) as f64 / period as f64,
+        rho,
+    })
+}
+
 struct Grain {
     y: i64,
     n: usize,
@@ -263,14 +438,16 @@ pub fn render(
     let grains = schedule(map.n_out, cfg, anchors);
     // Reads reach at most `search + n/2` beyond the source range; the margin covers that,
     // and anything further falls back to `reflect`.
+    // Blending looks up to one maximum pitch period beyond the normal search.
+    let blend_reach = cfg.blend.as_ref().map_or(0, |b| b.max_period);
     let reach = grains
         .iter()
-        .map(|g| g.search + g.n / 2 + 2)
+        .map(|g| g.search + blend_reach + g.n / 2 + 2)
         .max()
         .unwrap_or(0);
     let mono_p = Padded::new(mono, reach);
     let chans_p: Vec<Padded> = channels.iter().map(|c| Padded::new(c, reach)).collect();
-    let mut tmp_b = Vec::new();
+    let (mut tmp_b, mut tmp_c) = (Vec::new(), Vec::new());
     let (mut cands, mut scores): (Vec<i64>, Vec<f64>) = (Vec::new(), Vec::new());
     let mut onsets: Vec<i64> = anchors.iter().map(|a| a.in_onset as i64).collect();
     onsets.sort_unstable();
@@ -382,6 +559,39 @@ pub fn render(
                     }
                 }
             };
+        // Strong slow-down: blend the aligned periods on either side of the prediction
+        // instead of repeating one (falls back to `c` when no clean pair exists).
+        let blend = match &cfg.blend {
+            Some(bc)
+                if !g.transient
+                    && !anchored
+                    && tmpl.len() >= 4
+                    && t_energy > 1e-9 * mean_sq * tmpl.len() as f64 + 1e-30
+                    && local_ratio(map, g.y, g.hop) >= bc.min_ratio =>
+            {
+                find_pair(
+                    &mono_p,
+                    mono,
+                    &tmpl,
+                    ov_a - g.y,
+                    pred,
+                    c,
+                    half,
+                    cfg.coarse_step.max(1),
+                    bc,
+                    &crosses,
+                    &mut cands,
+                    &mut scores,
+                    (&mut tmp_b, &mut tmp_c),
+                )
+            }
+            _ => None,
+        };
+        let c = match blend {
+            // The blend sits at the predicted position.
+            Some(_) => pred,
+            None => c,
+        };
         abs_off_sum += (c - pred).abs() as f64;
         prev_c = Some(c);
         stats.grains += 1;
@@ -404,21 +614,48 @@ pub fn render(
             let s0 = c - half + i0 as i64;
             let len = i1 - i0;
             let w = &win[i0..i1];
-            for (ch, cp) in chans_p.iter().enumerate() {
-                let src = read(cp, channels[ch], s0, len, &mut tmp_b);
-                for ((a, &w), &x) in acc[ch][y0..y0 + len].iter_mut().zip(w).zip(src) {
-                    *a += w as f64 * x as f64;
+            match blend {
+                None => {
+                    for (ch, cp) in chans_p.iter().enumerate() {
+                        let src = read(cp, channels[ch], s0, len, &mut tmp_b);
+                        for ((a, &w), &x) in acc[ch][y0..y0 + len].iter_mut().zip(w).zip(src) {
+                            *a += w as f64 * x as f64;
+                        }
+                    }
+                    let src = read(&mono_p, mono, s0, len, &mut tmp_b);
+                    for (((a, ws), &w), &x) in acc_m[y0..y0 + len]
+                        .iter_mut()
+                        .zip(&mut wsum[y0..y0 + len])
+                        .zip(w)
+                        .zip(src)
+                    {
+                        *a += w as f64 * x as f64;
+                        *ws += w as f64;
+                    }
                 }
-            }
-            let src = read(&mono_p, mono, s0, len, &mut tmp_b);
-            for (((a, ws), &w), &x) in acc_m[y0..y0 + len]
-                .iter_mut()
-                .zip(&mut wsum[y0..y0 + len])
-                .zip(w)
-                .zip(src)
-            {
-                *a += w as f64 * x as f64;
-                *ws += w as f64;
+                Some(pair) => {
+                    stats.blended_grains += 1;
+                    let (sb, sa) = (
+                        pair.before - half + i0 as i64,
+                        pair.after - half + i0 as i64,
+                    );
+                    let gain = pair.gain();
+                    let (wb, wa) = ((1.0 - pair.alpha) * gain, pair.alpha * gain);
+                    let mut mix = |acc: &mut [f64], p: &Padded, x: &[f32]| {
+                        let b = read(p, x, sb, len, &mut tmp_b);
+                        let a = read(p, x, sa, len, &mut tmp_c);
+                        for (((o, &w), &xb), &xa) in acc.iter_mut().zip(w).zip(b).zip(a) {
+                            *o += w as f64 * (wb * xb as f64 + wa * xa as f64);
+                        }
+                    };
+                    for (ch, cp) in chans_p.iter().enumerate() {
+                        mix(&mut acc[ch][y0..y0 + len], cp, channels[ch]);
+                    }
+                    mix(&mut acc_m[y0..y0 + len], &mono_p, mono);
+                    for (ws, &w) in wsum[y0..y0 + len].iter_mut().zip(w) {
+                        *ws += w as f64;
+                    }
+                }
             }
         }
         covered_to = covered_to.max(g.y + half);

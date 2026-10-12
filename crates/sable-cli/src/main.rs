@@ -66,6 +66,10 @@ struct Cli {
     /// --stretch alone.
     #[arg(long, default_value_t = 0.0, allow_negative_numbers = true)]
     pitch: f64,
+    /// Experimental: for strong local slow-downs (>= 1.8x), blend the two aligned pitch
+    /// periods around each grain's source position instead of repeating one.
+    #[arg(long)]
+    period_blend: bool,
     /// Formant handling for --pitch.
     #[arg(long, value_enum, default_value_t = Formants::Preserve)]
     formants: Formants,
@@ -181,6 +185,7 @@ fn run(cli: Cli) -> Result<(), String> {
     };
     opts.seed = cli.seed;
     opts.threads = cli.threads;
+    opts.period_blend = cli.period_blend;
     opts.diagnostics = cli.features;
     opts.quality = match cli.quality {
         Quality::Fast => QualityPreset::Fast,

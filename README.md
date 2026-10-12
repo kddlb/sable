@@ -66,6 +66,7 @@ target/release/sable -i speech.wav -o faster.wav -s 0.75 --seed 42 \
 | `--skip-trailing-silence` | the same after the last sound, keeping a 50 ms post-roll (`--silence-postroll-ms`). Combine both with `--duration` so the target applies to the speech, not the room tone around it. |
 | `--generic` | uniform generic WSOLA with all speech handling off (comparison baseline) |
 | `--pitch ST` | shift the pitch by `ST` semitones (−24…24, fractional allowed) without changing the duration set by `--stretch`. Use `--stretch 1` for a pure pitch shift. See [ALGORITHM §10a](docs/ALGORITHM.md). |
+| `--period-blend` | experimental, off by default: where the local slow-down is ≥ 1.8×, blend the two aligned pitch periods around each grain's source position instead of repeating one and skipping ahead. See [ALGORITHM §7](docs/ALGORITHM.md). |
 | `--formants preserve\|shift` | with `--pitch`: keep the spectral envelope (default, same voice) or move it with the pitch (tape-speed character) |
 | `--progress` | print each processing phase with its time and a short summary to stderr |
 

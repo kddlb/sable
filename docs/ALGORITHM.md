@@ -323,6 +323,36 @@ without changing a single output bit:
 WSOLA itself stays sequential: each grain is matched against output that earlier grains
 wrote.
 
+**Experimental: blending pitch periods for strong slow-downs** (`Options::period_blend`,
+`--period-blend`, off by default). When a segment is slowed down a lot, plain WSOLA
+cannot advance the source smoothly. It plays a little at normal speed, re-uses the same
+pitch period, then skips ahead by a period when it drifts to the edge of its search. A
+trace of a vowel at 3× shows exactly that: steps of a full hop, then steps of about one
+period back.
+
+With blending on, a grain whose local factor is at least 1.8 (outside burst zones) is
+built from **two** source positions instead of one:
+
+1. The normal best match `c*` fixes the phase. The strongest other correlation peak 2–16 ms
+   away gives the local pitch period `T`.
+2. Positions in phase with the output lie on the lattice `c* + k·T`. The two lattice
+   points `before ≤ U(y) ≤ after` that bracket the time map's position are refined at full
+   resolution.
+3. If each still matches the overlap (correlation ≥ 0.5) and the two source grains match
+   each other (≥ 0.7), the grain is `(1 − α)·before + α·after`, with
+   `α = (U(y) − before) / T`, scaled by `1 / √((1−α)² + α² + 2α(1−α)ρ)` to keep its power.
+   Otherwise the plain choice is used.
+
+The output then follows the time map continuously, morphing from one period into the
+next instead of repeating and skipping. On the local recordings at 3×, 67–96 % of the
+grains in voiced segments blend (almost none elsewhere), and the share of grains whose
+source step departs from the time map's by more than 2 ms falls from 44–92 % to 14–33 %
+on three speech recordings (2 % remain on a sung vocal).
+Measured side effects are small: about 0.1–0.3 dB less energy above 3 kHz relative to
+below 1 kHz, and a level change within ±0.3 dB. WSOLA takes about 3× as long when blending
+is on. Whether it sounds better has not been judged by listening yet;
+`examples/blend_eval` renders an A/B set.
+
 Grain positions follow the time map, so WSOLA stretches each segment by its own budgeted
 amount. That is the "variable rate".
 
