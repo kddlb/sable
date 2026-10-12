@@ -21,11 +21,16 @@
 
 pub mod audio;
 pub mod budget;
+pub mod detect;
 pub mod error;
+pub mod features;
+pub mod fft;
 pub mod options;
 pub mod ratio;
 pub mod report;
 pub mod segments;
+pub mod synth;
+pub mod windows;
 
 pub use audio::{AudioBuffer, AudioView};
 pub use error::StretchError;
@@ -66,6 +71,21 @@ impl Layers {
             ("sibilant_noise", &self.sibilant_noise),
         ]
     }
+}
+
+/// Runs the shared analysis and event segmentation only (no rendering).
+pub fn analyze_events(
+    input: &AudioView<'_>,
+) -> Result<(features::Features, detect::Detection), StretchError> {
+    use detect::EventDetector;
+    input.validate()?;
+    let feats = features::analyze(
+        input.channels,
+        input.sample_rate,
+        &features::FeatureConfig::default(),
+    );
+    let det = detect::HeuristicDetector::default().detect(&feats);
+    Ok((feats, det))
 }
 
 /// Time-stretches `input` by `ratio` (= duration_out / duration_in).
