@@ -5,3 +5,5 @@
 /speech_files.txt
 *.wav
 !/fixtures/**/*.wav
+/stop_labels.txt
+/local_audio/

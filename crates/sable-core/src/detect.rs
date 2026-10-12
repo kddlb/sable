@@ -71,14 +71,26 @@ impl Default for DetectorConfig {
 pub struct BurstCandidate {
     pub onset: u64,
     pub end: u64,
+    /// 1-ms pre-emphasised energy jump over the preceding ~20 ms.
     pub jump_db: f64,
+    /// Time to come within 3 dB of the local maximum (diagnostic only).
     pub rise_ms: f64,
-    pub hf_frac: f64,
+    /// Fraction (≥ 2 kHz) of the energy *added* at the onset relative to the 4 ms just
+    /// before it; robust to a steady low-frequency background.
+    pub hf_added: f64,
+    /// Frame periodicity 5 ms after the onset (low = aperiodic release/aspiration).
+    pub periodicity_after: f64,
+    /// Peak 1-ms level in the first 3 ms minus the minimum 2-ms level 4–15 ms later.
+    /// Negative = energy keeps growing (fricative/whisper onset).
+    pub dip_db: f64,
+    /// Peak 0.25-ms energy around the onset over the median 3–10 ms later.
+    pub spike_db: f64,
     pub valley_depth_db: Option<f64>,
     pub c_jump: f64,
-    pub c_rise: f64,
-    pub c_broadband: f64,
+    pub c_aperiodic: f64,
     pub c_valley: f64,
+    pub c_dip: f64,
+    pub c_evidence: f64,
     pub confidence: f64,
     pub accepted: bool,
 }
@@ -463,17 +475,77 @@ impl HeuristicDetector {
             let end = (end_blk * bl)
                 .clamp(onset + min_len, onset + max_len)
                 .min(f.n);
-            // Broadband check over a ~4 ms window at the onset.
-            let mut buf = vec![0f32; short_fft];
-            for (k, v) in buf.iter_mut().enumerate() {
-                *v = *x.get(onset + k).unwrap_or(&0.0);
-            }
-            let spec = sfft.forward_windowed(&buf, &swin);
+            // High-band share of the energy *added* at the onset (≈4 ms window vs the 4 ms
+            // before it, ignoring < 300 Hz so a steady low-frequency bed does not dominate).
             let k2 =
-                ((2000.0 * short_fft as f64 / f.fs as f64).round() as usize).min(spec.len() - 1);
-            let tot: f64 = spec.iter().map(|c| c.norm_sqr() as f64).sum();
-            let hf: f64 = spec[k2..].iter().map(|c| c.norm_sqr() as f64).sum();
-            let hf_frac = if tot > 0.0 { hf / tot } else { 0.0 };
+                ((2000.0 * short_fft as f64 / f.fs as f64).round() as usize).min(short_fft / 2);
+            let k0 = ((300.0 * short_fft as f64 / f.fs as f64).round() as usize).min(k2);
+            let mut bands = |start: isize| {
+                let mut buf = vec![0f32; short_fft];
+                for (k, v) in buf.iter_mut().enumerate() {
+                    let i = start + k as isize;
+                    *v = if i >= 0 {
+                        *x.get(i as usize).unwrap_or(&0.0)
+                    } else {
+                        0.0
+                    };
+                }
+                let spec = sfft.forward_windowed(&buf, &swin);
+                let lo: f64 = spec[k0..k2].iter().map(|c| c.norm_sqr() as f64).sum();
+                let hi: f64 = spec[k2..].iter().map(|c| c.norm_sqr() as f64).sum();
+                (lo, hi)
+            };
+            let (lo_post, hi_post) = bands(onset as isize);
+            let (lo_pre, hi_pre) =
+                bands(onset as isize - short_fft as isize - ms_to_samples(1.0, f.fs) as isize);
+            let add_hi = (hi_post - hi_pre).max(0.0);
+            let add_lo = (lo_post - lo_pre).max(0.0);
+            let hf_added = add_hi / (add_hi + add_lo + 1e-30);
+            // Aperiodicity just after the release (voiceless release / aspiration).
+            let periodicity_after =
+                f.periodicity[f.frame_of((onset + ms_to_samples(5.0, f.fs)).min(f.n - 1))] as f64;
+            // Burst-then-dip on the 1-ms envelope.
+            let ob = onset / bl;
+            let peak3 = e[ob..(ob + 3).min(nb)]
+                .iter()
+                .fold(f32::MIN, |a, &v| a.max(v));
+            let dmin = ((ob + 4)..(ob + 15).min(nb.saturating_sub(1)))
+                .map(|m| 0.5 * (e[m] + e[m + 1]))
+                .fold(f32::MAX, f32::min);
+            let dip_db = if dmin == f32::MAX {
+                0.0
+            } else {
+                (peak3 - dmin) as f64
+            };
+            // Impulsiveness on 0.25-ms blocks.
+            let q = ms_to_samples(0.25, f.fs).max(1);
+            let qe = |start: isize| {
+                let mut acc = 0f64;
+                for k in 0..q as isize {
+                    let i = start + k;
+                    if i > 0 && (i as usize) < x.len() {
+                        let v = x[i as usize] as f64 - 0.97 * x[i as usize - 1] as f64;
+                        acc += v * v;
+                    }
+                }
+                acc / q as f64 + 1e-20
+            };
+            let one = ms_to_samples(1.0, f.fs) as isize;
+            let on = onset as isize;
+            let mut pk = 0f64;
+            let mut t = on - one;
+            while t < on + 3 * one {
+                pk = pk.max(qe(t));
+                t += q as isize;
+            }
+            let mut tail = Vec::new();
+            let mut t = on + 3 * one;
+            while t < on + 10 * one {
+                tail.push(qe(t));
+                t += q as isize;
+            }
+            tail.sort_by(f64::total_cmp);
+            let spike_db = 10.0 * (pk / tail[tail.len() / 2]).log10();
             // Closure valley before the onset.
             let gap = ms_to_samples(10.0, f.fs);
             let back = ms_to_samples(c.closure_max_ms, f.fs);
@@ -488,22 +560,31 @@ impl HeuristicDetector {
             } else {
                 None
             };
-            let c_jump = sigmoid((jump - c.burst_jump_db) / 3.0);
-            let c_rise = sigmoid((3.0 - rise_ms) / 0.8);
-            let c_bb = sigmoid((hf_frac - 0.25) / 0.07);
-            let c_valley = valley_depth.map_or(0.5, |d| sigmoid((d - 12.0) / 4.0));
-            let confidence = c_jump.sqrt() * c_rise * c_bb * (0.4 + 0.6 * c_valley);
+            // Evidence model (tuned on labelled Spanish/English stops, see docs):
+            // a stop release is aperiodic right after the onset, follows a closure valley,
+            // does not keep growing like a fricative or whispered-vowel onset, and is either
+            // impulsive or adds high-band energy.
+            let c_jump = sigmoid((jump - (c.burst_jump_db - 1.0)) / 3.0).sqrt();
+            let c_aperiodic = sigmoid((0.62 - periodicity_after) / 0.05);
+            let c_valley = valley_depth.map_or(0.6, |d| sigmoid((d - 8.0) / 2.0));
+            let c_dip = sigmoid((dip_db + 6.0) / 1.5);
+            let c_evidence = sigmoid((spike_db - 1.0) / 1.5).max(sigmoid((hf_added - 0.5) / 0.07));
+            let confidence = c_jump * c_aperiodic * c_valley * c_dip * c_evidence;
             out.push(BurstCandidate {
                 onset: onset as u64,
                 end: end as u64,
                 jump_db: jump,
                 rise_ms,
-                hf_frac,
+                hf_added,
+                periodicity_after,
+                dip_db,
+                spike_db,
                 valley_depth_db: valley_depth,
                 c_jump,
-                c_rise,
-                c_broadband: c_bb,
+                c_aperiodic,
                 c_valley,
+                c_dip,
+                c_evidence,
                 confidence,
                 accepted: confidence >= c.burst_confidence,
             });
@@ -572,12 +653,20 @@ impl HeuristicDetector {
         s.scores = SegmentScores {
             peak_flux: b.jump_db,
             valley_depth_db: b.valley_depth_db.unwrap_or(0.0),
-            hf_ratio: b.hf_frac,
+            hf_ratio: b.hf_added,
+            periodicity: b.periodicity_after,
             ..SegmentScores::default()
         };
         s.reasons.push(format!(
-            "burst: jump {:.1} dB, rise {:.2} ms, hf {:.2}, confidence {:.2}",
-            b.jump_db, b.rise_ms, b.hf_frac, b.confidence
+            "burst: jump {:.1} dB, periodicity after {:.2}, dip {:.1} dB, spike {:.1} dB,              added-HF {:.2}, valley {}, confidence {:.2}",
+            b.jump_db,
+            b.periodicity_after,
+            b.dip_db,
+            b.spike_db,
+            b.hf_added,
+            b.valley_depth_db
+                .map_or("-".into(), |v| format!("{v:.1} dB")),
+            b.confidence
         ));
         paint(segs, s);
         // Aspiration: following aperiodic, non-silent frames. Short sibilant-like runs count

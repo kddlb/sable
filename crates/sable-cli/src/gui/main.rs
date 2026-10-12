@@ -1370,8 +1370,10 @@ impl App {
                         for h in [
                             "onset",
                             "jump dB",
-                            "rise ms",
-                            "HF frac",
+                            "periodicity after",
+                            "dip dB",
+                            "spike dB",
+                            "added HF",
                             "valley dB",
                             "confidence",
                             "",
@@ -1384,8 +1386,10 @@ impl App {
                                 jump = Some(b.onset as f64);
                             }
                             ui.label(format!("{:.1}", b.jump_db));
-                            ui.label(format!("{:.1}", b.rise_ms));
-                            ui.label(format!("{:.2}", b.hf_frac));
+                            ui.label(format!("{:.2}", b.periodicity_after));
+                            ui.label(format!("{:.1}", b.dip_db));
+                            ui.label(format!("{:.1}", b.spike_db));
+                            ui.label(format!("{:.2}", b.hf_added));
                             ui.label(b.valley_depth_db.map_or("–".into(), |v| format!("{v:.1}")));
                             ui.label(format!("{:.2}", b.confidence));
                             if b.accepted {

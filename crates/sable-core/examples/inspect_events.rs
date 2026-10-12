@@ -69,11 +69,13 @@ fn main() {
     println!("\nburst candidates:");
     for b in &det.burst_candidates {
         println!(
-            "  {:>9.1} ms  jump {:>5.1} dB  rise {:>4.1} ms  hf {:.2}  valley {:>6}  conf {:.2} {}",
+            "  {:>9.1} ms  jump {:>5.1} dB  per {:.2}  dip {:>5.1}  spike {:>5.1}  hf+ {:.2}  valley {:>6}  conf {:.2} {}",
             ms(b.onset),
             b.jump_db,
-            b.rise_ms,
-            b.hf_frac,
+            b.periodicity_after,
+            b.dip_db,
+            b.spike_db,
+            b.hf_added,
             b.valley_depth_db
                 .map_or("-".to_string(), |v| format!("{v:.1}")),
             b.confidence,

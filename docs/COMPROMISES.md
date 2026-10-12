@@ -73,14 +73,39 @@ silently concealed. This document lists those trade-offs.
 * Resynthesis never runs on events below the adaptive silence threshold, so silence and
   near-silence are never filled with fabricated hiss.
 
-## 5. Detector conservatism
+## 5. Detector conservatism and burst evidence
 
-* The heuristic detector prefers `Transition`/`Other` (generic WSOLA) to a wrong label. On
-  two real recordings it accepted only 1 of 24 and 1 of 12 burst candidates. Most real
-  stops are therefore stretched by generic WSOLA, and A/B differences on real speech come
-  mostly from sibilants and class-dependent timing, not from burst anchoring.
-* Thresholds were tuned on synthetic fixtures and spot-checked on two recordings by one
-  speaker. They are not validated across speakers, languages, or recording conditions.
+* The heuristic detector prefers `Transition`/`Other` (generic WSOLA) to a wrong label.
+* **Burst score (revised).** A candidate is a sharp ≥ 15 dB jump in the 1-ms pre-emphasised
+  envelope. It is protected when the product of five soft factors reaches 0.5:
+  * **Aperiodic right after the onset.** Frame periodicity 5 ms later is below about 0.62.
+    Voiceless releases and aspiration are aperiodic; vowel onsets, taps and trills are not.
+  * **A closure valley** of about 8 dB or more before the onset (neutral at file start).
+  * **No sustained growth.** The 1-ms level does not keep rising for 15 ms (dip > −6 dB),
+    which rejects /s/ and whispered-vowel onsets.
+  * **Burst evidence.** Either an impulsive 0.25-ms spike, or ≥ 50 % of the energy *added*
+    at the onset lies above 2 kHz. Measuring added energy relative to the 4 ms before
+    ignores a steady low-frequency background.
+  * **The 1-ms jump itself.**
+
+  The previous score required ≥ 25 % *absolute* energy above 2 kHz. That suits English
+  aspirated and alveolar stops, but it rejected almost every Spanish /p/ and /k/, whose
+  compact or low bursts before /o, a/ put < 10 % above 2 kHz.
+* **How it was tuned, and what that is worth.** The score was tuned against **hand labels
+  made by inspecting spectrograms (not by listening)** on four short ElevenLabs TTS clips:
+  two Spanish sentences dense in /p t k/, one English sentence, and one partly whispered.
+  The labelled stops protected went from 5 / 24 to 20 / 24, with 4 false positives. The
+  false positives were three abrupt utterance onsets after silence and one encoder click at
+  the end of a file; dry-copying such onsets at 1× is acoustically benign.
+  * **Misses.** Voiced or periodic-onset stops (/b/ in "boot" and "bucket", the second
+    /k/ in "poco") and one weak /p/. Voiced stops are periodic right after release by
+    nature, so the aperiodicity cue cannot see them. They fall back to WSOLA.
+  * **The /k/ in "bucket"** never reaches the 15 dB candidate threshold at all.
+  * On the maintainer's own recordings the protected-burst count rose from 1 → 7,
+    1 → 3 and 0 → 2. **These are not verified by listening.** Synthetic voices may
+    behave differently from real recordings, so treat the tuning as provisional.
+* `examples/stop_eval` re-runs this evaluation from a gitignored `stop_labels.txt`
+  (`path | true onsets ms | unsure ms`), so labels can be corrected or extended.
 
 ## 6. Generic WSOLA limits
 

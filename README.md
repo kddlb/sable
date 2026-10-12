@@ -184,6 +184,7 @@ cargo bench -p sable-core --bench speech
 cargo run --release -p sable-core --example quality_report -- --write
 cargo run --release -p sable-core --example inspect_events -- fixture:stop 48000
 cargo run --release -p sable-core --example ab_render
+cargo run --release -p sable-core --example stop_eval -- --verbose   # needs stop_labels.txt
 ```
 
 Real-speech tests and examples read local recordings from `SABLE_SPEECH_WAV` (a
