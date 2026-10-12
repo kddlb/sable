@@ -77,8 +77,8 @@ fn main() {
         if verbose {
             println!("== {name}");
             println!(
-                "{:>9} {:>5} {:>5} {:>6} {:>6} {:>5} {:>6} {:>5}  label",
-                "ms", "jump", "per", "dip", "spike", "hf+", "valley", "conf"
+                "{:>9} {:>5} {:>5} {:>5} {:>6} {:>6} {:>5} {:>6} {:>5}  label",
+                "ms", "jump", "per", "perF", "dip", "spike", "hf+", "valley", "conf"
             );
         }
         for b in &det.burst_candidates {
@@ -102,9 +102,10 @@ fn main() {
             };
             if verbose {
                 println!(
-                    "{ms:>9.1} {:>5.1} {:>5.2} {:>6.1} {:>6.1} {:>5.2} {:>6} {:>5.2}  {label}",
+                    "{ms:>9.1} {:>5.1} {:>5.2} {:>5.2} {:>6.1} {:>6.1} {:>5.2} {:>6} {:>5.2}  {label}",
                     b.jump_db,
                     b.periodicity_after,
+                    b.periodicity_follow,
                     b.dip_db,
                     b.spike_db,
                     b.hf_added,

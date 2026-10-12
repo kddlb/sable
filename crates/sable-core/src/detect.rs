@@ -85,11 +85,18 @@ pub struct BurstCandidate {
     pub dip_db: f64,
     /// Peak 0.25-ms energy around the onset over the median 3–10 ms later.
     pub spike_db: f64,
+    /// Highest frame periodicity 20–60 ms after the onset: voicing follows a stop release
+    /// quickly, but not an /s/ or a whispered vowel.
+    pub periodicity_follow: f64,
     pub valley_depth_db: Option<f64>,
+    /// Closure level above the recording's noise floor (dB; diagnostic only).
+    pub closure_above_floor_db: Option<f64>,
     pub c_jump: f64,
     pub c_aperiodic: f64,
     pub c_valley: f64,
     pub c_dip: f64,
+    /// `max(dip, voicing-follows)` factor actually used.
+    pub c_growth: f64,
     pub c_evidence: f64,
     pub confidence: f64,
     pub accepted: bool,
@@ -504,6 +511,12 @@ impl HeuristicDetector {
             // Aperiodicity just after the release (voiceless release / aspiration).
             let periodicity_after =
                 f.periodicity[f.frame_of((onset + ms_to_samples(5.0, f.fs)).min(f.n - 1))] as f64;
+            // Voicing within 20–60 ms after the release.
+            let periodicity_follow = {
+                let ja = f.frame_of((onset + ms_to_samples(20.0, f.fs)).min(f.n - 1));
+                let jb = f.frame_of((onset + ms_to_samples(60.0, f.fs)).min(f.n - 1));
+                f.periodicity[ja..=jb].iter().fold(0f32, |a, &v| a.max(v)) as f64
+            };
             // Burst-then-dip on the 1-ms envelope.
             let ob = onset / bl;
             let peak3 = e[ob..(ob + 3).min(nb)]
@@ -549,6 +562,7 @@ impl HeuristicDetector {
             // Closure valley before the onset.
             let gap = ms_to_samples(10.0, f.fs);
             let back = ms_to_samples(c.closure_max_ms, f.fs);
+            let mut closure_above_floor = None;
             let valley_depth = if onset >= gap + f.hop {
                 let ja = f.frame_of(onset.saturating_sub(back));
                 let jb = f.frame_of(onset - gap);
@@ -556,6 +570,7 @@ impl HeuristicDetector {
                 let jc = f.frame_of(onset);
                 let jd = f.frame_of((onset + gap).min(f.n - 1));
                 let vmax = f.log_rms[jc..=jd].iter().fold(f32::MIN, |a, &v| a.max(v));
+                closure_above_floor = Some((vmin - f.noise_floor_db) as f64);
                 Some((vmax - vmin) as f64)
             } else {
                 None
@@ -566,10 +581,18 @@ impl HeuristicDetector {
             // impulsive or adds high-band energy.
             let c_jump = sigmoid((jump - (c.burst_jump_db - 1.0)) / 3.0).sqrt();
             let c_aperiodic = sigmoid((0.62 - periodicity_after) / 0.05);
+            // Closure depth. (A "near the noise floor" alternative was tried for noisy phone
+            // recordings and did not separate stops from vowel onsets; see COMPROMISES §5.)
             let c_valley = valley_depth.map_or(0.6, |d| sigmoid((d - 8.0) / 2.0));
-            let c_dip = sigmoid((dip_db + 6.0) / 1.5);
-            let c_evidence = sigmoid((spike_db - 1.0) / 1.5).max(sigmoid((hf_added - 0.5) / 0.07));
-            let confidence = c_jump * c_aperiodic * c_valley * c_dip * c_evidence;
+            let c_dip = sigmoid((dip_db - 2.0) / 1.5);
+            // Fricative and whispered-vowel onsets keep growing smoothly and stay aperiodic.
+            // A stop shows a dip after the release, OR quick voicing (weak unaspirated bursts
+            // run straight into a louder vowel), OR a clearly impulsive release (affricates).
+            let c_growth = c_dip
+                .max(sigmoid((periodicity_follow - 0.6) / 0.05))
+                .max(sigmoid((spike_db - 3.0) / 1.5));
+            let c_evidence = sigmoid((spike_db - 1.0) / 1.5).max(sigmoid((hf_added - 0.3) / 0.07));
+            let confidence = c_jump * c_aperiodic * c_valley * c_growth * c_evidence;
             out.push(BurstCandidate {
                 onset: onset as u64,
                 end: end as u64,
@@ -579,11 +602,14 @@ impl HeuristicDetector {
                 periodicity_after,
                 dip_db,
                 spike_db,
+                periodicity_follow,
                 valley_depth_db: valley_depth,
+                closure_above_floor_db: closure_above_floor,
                 c_jump,
                 c_aperiodic,
                 c_valley,
                 c_dip,
+                c_growth,
                 c_evidence,
                 confidence,
                 accepted: confidence >= c.burst_confidence,

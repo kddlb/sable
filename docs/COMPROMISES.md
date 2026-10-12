@@ -91,19 +91,31 @@ silently concealed. This document lists those trade-offs.
   The previous score required ≥ 25 % *absolute* energy above 2 kHz. That suits English
   aspirated and alveolar stops, but it rejected almost every Spanish /p/ and /k/, whose
   compact or low bursts before /o, a/ put < 10 % above 2 kHz.
-* **How it was tuned, and what that is worth.** The score was tuned against **hand labels
-  made by inspecting spectrograms (not by listening)** on four short ElevenLabs TTS clips:
-  two Spanish sentences dense in /p t k/, one English sentence, and one partly whispered.
-  The labelled stops protected went from 5 / 24 to 20 / 24, with 4 false positives. The
-  false positives were three abrupt utterance onsets after silence and one encoder click at
-  the end of a file; dry-copying such onsets at 1× is acoustically benign.
-  * **Misses.** Voiced or periodic-onset stops (/b/ in "boot" and "bucket", the second
-    /k/ in "poco") and one weak /p/. Voiced stops are periodic right after release by
-    nature, so the aperiodicity cue cannot see them. They fall back to WSOLA.
-  * **The /k/ in "bucket"** never reaches the 15 dB candidate threshold at all.
-  * On the maintainer's own recordings the protected-burst count rose from 1 → 7,
-    1 → 3 and 0 → 2. **These are not verified by listening.** Synthetic voices may
-    behave differently from real recordings, so treat the tuning as provisional.
+* **Growth factor.** A stop must show one of three things after the onset, which
+  rejects /s/ and whispered-vowel onsets (they rise smoothly and stay aperiodic):
+  * a dip of ≥ 2 dB
+  * voicing within 20–60 ms (a weak unaspirated burst often runs straight into a
+    louder vowel)
+  * a clearly impulsive release (affricates such as Spanish *ch*)
+* **How it was tuned, and what that is worth.** The labels mark burst onsets from
+  spectrograms plus the known text; nobody verified them by listening.
+
+  | material | labelled stops protected | false positives | used for tuning? |
+  |---|---|---|---|
+  | 4 ElevenLabs TTS clips (Spanish ×2, English, partly whispered) | 20 / 24 (was 5) | 4 | yes |
+  | Maintainer reading Martí, headset mic | 8 / 8 (was 4) | 2 | yes |
+  | Same text, iPhone stereo (noise floor ~14 dB below speech) | **1 / 8** | 2 | **no (held out)** |
+
+  * **The held-out phone recording shows the limit.** Its noise fills the stop closures,
+    so valleys measure only 1–2 dB. Three of its stops (*De*, *donde*, *antes*) never
+    become candidates at all. A "closure near the noise floor" cue was tried and
+    rejected, because in such recordings every onset after a pause is near the floor.
+    On noisy material most stops therefore fall back to WSOLA, which is the old
+    behaviour.
+  * **False positives** are mostly abrupt onsets after silence: utterance starts, a
+    nasal onset, and an /l/ right after /s/. One is an encoder click at the very end of
+    a file. Dry-copying a few ms of such an onset at 1× is acoustically benign.
+  * **Misses.** Voiced stops (periodic right after release) and some weak labials.
 * `examples/stop_eval` re-runs this evaluation from a gitignored `stop_labels.txt`
   (`path | true onsets ms | unsure ms`), so labels can be corrected or extended.
 
