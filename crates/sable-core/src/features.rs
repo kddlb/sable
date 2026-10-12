@@ -19,6 +19,11 @@ pub struct FeatureConfig {
     pub hf_edge_hz: f64,
     pub low_band_hz: f64,
     pub fine_block_ms: f64,
+    /// For stereo input, run the detection features on a "dry centre" estimate: the
+    /// channels are time-aligned, then the side's power is subtracted from the mid's per
+    /// STFT bin. Diffuse reverb and decorrelated ambience sit roughly equally in mid and
+    /// side, so this keeps stop closures and pauses from filling with reverb tail.
+    pub center_analysis: bool,
 }
 
 impl Default for FeatureConfig {
@@ -33,6 +38,7 @@ impl Default for FeatureConfig {
             hf_edge_hz: 2500.0,
             low_band_hz: 1500.0,
             fine_block_ms: 1.0,
+            center_analysis: true,
         }
     }
 }
@@ -44,8 +50,14 @@ pub struct Features {
     pub n: usize,
     pub hop: usize,
     pub nfft: usize,
-    /// Analysis-only mono reference (never rendered).
+    /// Mono reference for rendering decisions (WSOLA grain matching, energy checks):
+    /// `0.5 (L + R)`, with an L/R-cancellation fallback.
     pub mono: Vec<f32>,
+    /// Signal the detection features were computed on: `mono`, or for stereo the dry
+    /// centre estimate (see [`FeatureConfig::center_analysis`]).
+    pub analysis: Vec<f32>,
+    /// Inter-channel lag (samples, R relative to L) removed before centre extraction.
+    pub center_lag: Option<i64>,
     /// Frame RMS in dB (20 ms rectangular window).
     pub log_rms: Vec<f32>,
     /// Positive spectral flux normalized by local magnitude sum, in `[0, 1]`.
@@ -132,9 +144,126 @@ fn percentile(v: &[f32], p: f64) -> f32 {
     s[idx]
 }
 
-/// Computes all features for the mono reference of `channels`.
+/// Global inter-channel lag (samples, R relative to L) by GCC-PHAT over STFT frames,
+/// searched within ±`max_lag`.
+pub fn interchannel_lag(l: &[f32], r: &[f32], n_fft: usize, max_lag: usize) -> i64 {
+    let bins = n_fft / 2 + 1;
+    let win = crate::windows::hann_periodic(n_fft);
+    let mut fft = RealFft::new(n_fft);
+    let mut g = vec![crate::fft::Complex::new(0.0, 0.0); bins];
+    let hop = n_fft / 2;
+    let mut s = 0;
+    while s + n_fft <= l.len().min(r.len()) {
+        let xl = fft.forward_windowed(&l[s..s + n_fft], &win).to_vec();
+        let xr = fft.forward_windowed(&r[s..s + n_fft], &win).to_vec();
+        for k in 1..bins - 1 {
+            // X_R conj(X_L)
+            let re = xr[k].re * xl[k].re + xr[k].im * xl[k].im;
+            let im = xr[k].im * xl[k].re - xr[k].re * xl[k].im;
+            let m = (re * re + im * im).sqrt();
+            if m > 1e-20 {
+                g[k].re += re / m;
+                g[k].im += im / m;
+            }
+        }
+        s += hop;
+    }
+    let c = fft.inverse(&g).to_vec();
+    let at = |d: i64| c[d.rem_euclid(n_fft as i64) as usize];
+    let max = max_lag.min(n_fft / 2 - 1) as i64;
+    (-max..=max).fold(0i64, |best, d| if at(d) > at(best) { d } else { best })
+}
+
+/// Dry-centre estimate of a stereo pair for analysis (never rendered): align the channels,
+/// then keep `max(|M|² − |S|², 0.01 |M|²)` per STFT bin with the mid's phase.
+///
+/// Returns `None` when, after alignment, the side is not at least 10 dB below the mid: then
+/// the side is not a minor ambience layer (e.g. a noisy spaced pair) and subtracting it
+/// would remove the source itself.
+pub fn center_reference(l: &[f32], r: &[f32], fs: u32) -> Option<(Vec<f32>, i64)> {
+    let n = l.len();
+    let n_fft = pow2_near_ms(25.0, fs);
+    let lag = interchannel_lag(l, r, n_fft, ms_to_samples(2.0, fs));
+    // Advance R by `lag` so it lines up with L.
+    let ra = |i: usize| -> f32 {
+        let j = i as i64 + lag;
+        if j >= 0 && (j as usize) < r.len() {
+            r[j as usize]
+        } else {
+            0.0
+        }
+    };
+    let mid: Vec<f32> = (0..n).map(|i| 0.5 * (l[i] + ra(i))).collect();
+    let side: Vec<f32> = (0..n).map(|i| 0.5 * (l[i] - ra(i))).collect();
+    let energy = |x: &[f32]| x.iter().map(|&v| (v as f64) * (v as f64)).sum::<f64>();
+    if energy(&side) > 0.1 * energy(&mid) {
+        return None;
+    }
+    let hop = n_fft / 4;
+    let win = crate::windows::sqrt_hann_periodic(n_fft);
+    let mut fft = RealFft::new(n_fft);
+    let mut acc = vec![0f64; n + n_fft];
+    let mut wsum = vec![0f64; n + n_fft];
+    let mut bm = vec![0f32; n_fft];
+    let mut bs = vec![0f32; n_fft];
+    let mut start = -(n_fft as i64) + hop as i64;
+    while start < n as i64 {
+        for k in 0..n_fft {
+            let i = start + k as i64;
+            let inside = i >= 0 && (i as usize) < n;
+            bm[k] = if inside { mid[i as usize] } else { 0.0 };
+            bs[k] = if inside { side[i as usize] } else { 0.0 };
+        }
+        let xs: Vec<f32> = fft
+            .forward_windowed(&bs, &win)
+            .iter()
+            .map(|c| c.norm_sqr())
+            .collect();
+        let mut xm = fft.forward_windowed(&bm, &win).to_vec();
+        for (k, c) in xm.iter_mut().enumerate() {
+            let pm = c.norm_sqr();
+            if pm > 0.0 {
+                let keep = (pm - xs[k]).max(0.01 * pm);
+                *c *= (keep / pm).sqrt();
+            }
+        }
+        let y = fft.inverse(&xm);
+        for k in 0..n_fft {
+            let i = start + k as i64;
+            if i >= 0 && (i as usize) < n {
+                let w = win[k] as f64;
+                acc[i as usize] += w * y[k] as f64;
+                wsum[i as usize] += w * w;
+            }
+        }
+        start += hop as i64;
+    }
+    let out = (0..n)
+        .map(|i| {
+            if wsum[i] > 1e-9 {
+                (acc[i] / wsum[i]) as f32
+            } else {
+                0.0
+            }
+        })
+        .collect();
+    Some((out, lag))
+}
+
+/// Computes all features for `channels` (detection runs on [`Features::analysis`]).
 pub fn analyze(channels: &[&[f32]], fs: u32, cfg: &FeatureConfig) -> Features {
-    let mono = mono_reference(channels);
+    let mono_render = mono_reference(channels);
+    // Centre extraction only for a genuine stereo pair whose mid did not cancel.
+    let mid_ok = channels.len() == 2
+        && mono_render.len() == channels[0].len()
+        && mono_render.iter().zip(channels[0]).any(|(a, b)| a != b);
+    let center = (cfg.center_analysis && mid_ok)
+        .then(|| center_reference(channels[0], channels[1], fs))
+        .flatten();
+    let (mono, center_lag) = match center {
+        Some((c, lag)) => (c, Some(lag)),
+        None => (mono_render.clone(), None),
+    };
     let n = mono.len();
     let hop = ms_to_samples(cfg.hop_ms, fs);
     let nf = n.div_ceil(hop).max(1);
@@ -269,7 +398,9 @@ pub fn analyze(channels: &[&[f32]], fs: u32, cfg: &FeatureConfig) -> Features {
         n,
         hop,
         nfft,
-        mono,
+        mono: mono_render,
+        analysis: mono,
+        center_lag,
         log_rms,
         flux,
         hf_ratio,

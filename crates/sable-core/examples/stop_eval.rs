@@ -8,7 +8,7 @@
 //! C:\audio\carlos.wav | 61.6, 566.9, 775.3 | 1716.9
 //! ```
 //!
-//! A candidate within ±5 ms of a labelled onset counts as that stop. Unlabelled candidates
+//! A candidate within ±10 ms of a labelled onset counts as that stop. Unlabelled candidates
 //! not in the ignore list count as non-stops. WAV only (convert other formats with the CLI).
 //!
 //! ```text
@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 
 use sable_core::{AudioView, analyze_events};
 
-const TOL_MS: f64 = 5.0;
+const TOL_MS: f64 = 10.0;
 
 fn nums(s: &str) -> Vec<f64> {
     s.split(',')

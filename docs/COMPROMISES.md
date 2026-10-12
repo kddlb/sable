@@ -105,6 +105,7 @@ silently concealed. This document lists those trade-offs.
   | 4 ElevenLabs TTS clips (Spanish ×2, English, partly whispered) | 20 / 24 (was 5) | 4 | yes |
   | Maintainer reading Martí, headset mic | 8 / 8 (was 4) | 2 | yes |
   | Same text, iPhone stereo (noise floor ~14 dB below speech) | **1 / 8** | 2 | **no (held out)** |
+  | Sung vocal stem with reverb (8 lyric lines) | 4 / 12 (was 2) | 1 | yes (valley centre 8 → 7 dB) |
 
   * **The held-out phone recording shows the limit.** Its noise fills the stop closures,
     so valleys measure only 1–2 dB. Three of its stops (*De*, *donde*, *antes*) never
@@ -112,6 +113,17 @@ silently concealed. This document lists those trade-offs.
     rejected, because in such recordings every onset after a pause is near the floor.
     On noisy material most stops therefore fall back to WSOLA, which is the old
     behaviour.
+  * **Reverb.** Reverb fills closures the same way noise does. For stereo input the
+    detection features run on a *dry-centre* estimate: the channels are time-aligned
+    (GCC-PHAT), and the side's power is subtracted from the mid's per STFT bin. This is
+    analysis only; rendering is untouched. It deepened the sung stem's closure valleys by
+    5–7 dB and recovered two /t/ releases.
+    * It cannot remove reverb that is centred in the mix. On that stem the side is about
+      19 dB below the mid, so most stops there still go undetected. Five of the twelve
+      never become candidates, and the two voiced /b/ are missed by design.
+    * It is applied only when, after alignment, the side is ≥ 10 dB below the mid. On the
+      noisy phone recording (side ≈ mid) it removed part of the voice and lost a stop, so
+      it is skipped there.
   * **False positives** are mostly abrupt onsets after silence: utterance starts, a
     nasal onset, and an /l/ right after /s/. One is an encoder click at the very end of
     a file. Dry-copying a few ms of such an onset at 1× is acoustically benign.

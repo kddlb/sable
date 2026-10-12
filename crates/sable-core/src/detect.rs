@@ -443,7 +443,7 @@ impl HeuristicDetector {
                 continue;
             }
             // Peak sample in the candidate neighbourhood of the pre-emphasised signal.
-            let x = &f.mono;
+            let x = &f.analysis;
             let d = |i: usize| x[i] as f64 - if i > 0 { 0.97 * x[i - 1] as f64 } else { 0.0 };
             let lo = (m * bl).saturating_sub(bl);
             let hi = ((m + 3) * bl).min(f.n);
@@ -583,7 +583,7 @@ impl HeuristicDetector {
             let c_aperiodic = sigmoid((0.62 - periodicity_after) / 0.05);
             // Closure depth. (A "near the noise floor" alternative was tried for noisy phone
             // recordings and did not separate stops from vowel onsets; see COMPROMISES §5.)
-            let c_valley = valley_depth.map_or(0.6, |d| sigmoid((d - 8.0) / 2.0));
+            let c_valley = valley_depth.map_or(0.6, |d| sigmoid((d - 7.0) / 2.0));
             let c_dip = sigmoid((dip_db - 2.0) / 1.5);
             // Fricative and whispered-vowel onsets keep growing smoothly and stay aperiodic.
             // A stop shows a dip after the release, OR quick voicing (weak unaspirated bursts
