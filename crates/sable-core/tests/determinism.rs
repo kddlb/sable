@@ -79,12 +79,18 @@ fn thread_count_does_not_change_output_or_report() {
             sample_rate: audio.sample_rate,
             channels: &refs,
         };
-        for (f, pitch) in [("0.7", 0.0), ("1.5", 0.0), ("1.25", 3.0)] {
+        for (f, pitch, lpc) in [
+            ("0.7", 0.0, false),
+            ("1.5", 0.0, false),
+            ("1.25", 3.0, false),
+            ("1.5", 0.0, true),
+        ] {
             let r = StretchRatio::parse(f).unwrap();
             let run = |threads| {
                 let opts = Options {
                     diagnostics: true,
                     pitch_semitones: pitch,
+                    lpc_residual: lpc,
                     threads,
                     ..Options::default()
                 };

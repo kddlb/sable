@@ -37,9 +37,20 @@ pub struct BlendConfig {
     pub min_ncc: f64,
     /// ...and at least this well with each other (so the mix is in phase).
     pub min_mutual: f64,
+    /// The same two thresholds where the F0 track gave the period. The pair is then one
+    /// real period apart by construction, and a slightly mismatched blend is smoother
+    /// than falling back to a repeated chunk, so only out-of-phase pairs are refused.
+    pub tracked_min_ncc: f64,
+    pub tracked_min_mutual: f64,
     /// Accepted distance between the two candidates (one pitch period), in frames.
     pub min_period: usize,
     pub max_period: usize,
+    /// F0 track (Hz per analysis frame, 0 where unvoiced) and its hop. Where it gives a
+    /// period, the search stays within half a period of the prediction and the pair is
+    /// taken one tracked period apart, instead of from the strongest correlation peak.
+    pub f0_hz: Vec<f32>,
+    pub f0_hop: usize,
+    pub fs: u32,
 }
 
 impl BlendConfig {
@@ -48,9 +59,38 @@ impl BlendConfig {
             min_ratio: 1.8,
             min_ncc: 0.5,
             min_mutual: 0.7,
+            tracked_min_ncc: 0.0,
+            tracked_min_mutual: 0.0,
             min_period: ms_to_samples(2.0, fs).max(2),
             max_period: ms_to_samples(16.0, fs),
+            f0_hz: Vec::new(),
+            f0_hop: 1,
+            fs,
         }
+    }
+
+    /// Attaches an F0 track whose frame `j` is centred on sample `j·hop + hop/2`.
+    pub fn with_f0(mut self, f0_hz: Vec<f32>, hop: usize) -> Self {
+        self.f0_hz = f0_hz;
+        self.f0_hop = hop.max(1);
+        self
+    }
+
+    /// Tracked pitch period (frames) at source position `x`, if voiced and in range.
+    fn period_at(&self, x: i64) -> Option<i64> {
+        if self.f0_hz.is_empty() {
+            return None;
+        }
+        let j =
+            ((x - (self.f0_hop / 2) as i64).max(0) as f64 / self.f0_hop as f64).round() as usize;
+        let f = *self.f0_hz.get(j.min(self.f0_hz.len() - 1))?;
+        if f <= 0.0 {
+            return None;
+        }
+        let t = (self.fs as f64 / f as f64).round() as i64;
+        (self.min_period as i64..=self.max_period as i64)
+            .contains(&t)
+            .then_some(t)
     }
 }
 
@@ -304,6 +344,7 @@ fn find_pair(
     half: i64,
     step: usize,
     bc: &BlendConfig,
+    period: Option<i64>,
     crosses: &dyn Fn(i64) -> bool,
     cands: &mut Vec<i64>,
     scores: &mut Vec<f64>,
@@ -314,18 +355,28 @@ fn find_pair(
     let s = step as i64;
     let (lo_p, hi_p) = (bc.min_period as i64, bc.max_period as i64);
     // Coarse correlation over c_star ± max_period: the strongest peak at a plausible
-    // period distance gives T.
-    cands.clear();
-    cands.extend((-hi_p..=hi_p).step_by(step).map(|d| c_star + d));
-    ncc_scores(p, x, tmpl, off, cands, step, e_coarse, scores);
-    let neighbour = (1..cands.len().saturating_sub(1))
-        .filter(|&k| scores[k] >= scores[k - 1] && scores[k] > scores[k + 1])
-        .filter(|&k| (lo_p..=hi_p).contains(&(cands[k] - c_star).abs()))
-        .max_by(|&a, &b| scores[a].total_cmp(&scores[b]))
-        .map(|k| cands[k])?;
+    // period distance gives T (unless the F0 track already gave it).
+    let neighbour = match period {
+        Some(_) => None,
+        None => {
+            cands.clear();
+            cands.extend((-hi_p..=hi_p).step_by(step).map(|d| c_star + d));
+            ncc_scores(p, x, tmpl, off, cands, step, e_coarse, scores);
+            Some(
+                (1..cands.len().saturating_sub(1))
+                    .filter(|&k| scores[k] >= scores[k - 1] && scores[k] > scores[k + 1])
+                    .filter(|&k| (lo_p..=hi_p).contains(&(cands[k] - c_star).abs()))
+                    .max_by(|&a, &b| scores[a].total_cmp(&scores[b]))
+                    .map(|k| cands[k])?,
+            )
+        }
+    };
+    // A tracked period is only accurate to a few frames: refine its lattice points more
+    // widely.
+    let radius = period.map_or(s, |t| s.max(t / 16));
     let mut refine = |c0: i64| -> Option<(i64, f64)> {
         cands.clear();
-        cands.extend((c0 - s + 1..=c0 + s - 1).filter(|&c| !crosses(c)));
+        cands.extend((c0 - radius + 1..=c0 + radius - 1).filter(|&c| !crosses(c)));
         ncc_scores(p, x, tmpl, off, cands, 1, e1, scores);
         cands
             .iter()
@@ -335,17 +386,25 @@ fn find_pair(
                 _ => Some((c, sc)),
             })
     };
-    let (nb, _) = refine(neighbour)?;
-    let t = (nb - c_star).abs();
+    let t = match (period, neighbour) {
+        (Some(t), _) => t,
+        (None, nb) => (refine(nb?)?.0 - c_star).abs(),
+    };
     if t < lo_p {
         return None;
     }
     let k = (pred - c_star).div_euclid(t);
+    let tracked = period.is_some();
     let (before, sb) = refine(c_star + k * t)?;
     let (after, sa) = refine(c_star + (k + 1) * t)?;
     let period = after - before;
-    if sb < bc.min_ncc
-        || sa < bc.min_ncc
+    let (min_ncc, min_mutual) = if tracked {
+        (bc.tracked_min_ncc, bc.tracked_min_mutual)
+    } else {
+        (bc.min_ncc, bc.min_mutual)
+    };
+    if sb < min_ncc
+        || sa < min_ncc
         || !(lo_p..=hi_p).contains(&period)
         || pred < before
         || pred > after
@@ -361,7 +420,7 @@ fn find_pair(
         tmp.0,
         tmp.1,
     );
-    if rho < bc.min_mutual {
+    if rho < min_mutual {
         return None;
     }
     Some(Pair {
@@ -483,7 +542,19 @@ pub fn render(
         // Prefer forward progression: never step back by more than one synthesis hop.
         // (Expansion legitimately re-uses a pitch period, which needs a short step back.)
         let lo_bound = prev_c.map_or(i64::MIN, |p| p - g.hop as i64 + 1);
-        let r = g.search as i64;
+        // Strong slow-down: the template always favours playing on, so an unrestricted
+        // search drifts to its edge and loops one chunk. With a tracked period the search
+        // stays within half a period of the prediction (one in-phase position).
+        let slow = match &cfg.blend {
+            Some(bc)
+                if !g.transient && !anchored && local_ratio(map, g.y, g.hop) >= bc.min_ratio =>
+            {
+                Some(bc)
+            }
+            _ => None,
+        };
+        let period = slow.and_then(|bc| bc.period_at(pred));
+        let r = period.map_or(g.search as i64, |t| (t + 1) / 2);
         let c =
             if anchored || tmpl.len() < 4 || t_energy <= 1e-9 * mean_sq * tmpl.len() as f64 + 1e-30
             {
@@ -561,13 +632,9 @@ pub fn render(
             };
         // Strong slow-down: blend the aligned periods on either side of the prediction
         // instead of repeating one (falls back to `c` when no clean pair exists).
-        let blend = match &cfg.blend {
+        let blend = match slow {
             Some(bc)
-                if !g.transient
-                    && !anchored
-                    && tmpl.len() >= 4
-                    && t_energy > 1e-9 * mean_sq * tmpl.len() as f64 + 1e-30
-                    && local_ratio(map, g.y, g.hop) >= bc.min_ratio =>
+                if tmpl.len() >= 4 && t_energy > 1e-9 * mean_sq * tmpl.len() as f64 + 1e-30 =>
             {
                 find_pair(
                     &mono_p,
@@ -579,6 +646,7 @@ pub fn render(
                     half,
                     cfg.coarse_step.max(1),
                     bc,
+                    period,
                     &crosses,
                     &mut cands,
                     &mut scores,

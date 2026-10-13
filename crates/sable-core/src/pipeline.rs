@@ -12,7 +12,7 @@ use crate::report::{AnalysisReport, FeatureDump, RenderPath, SegmentReport, Warn
 use crate::segments::{EventKind, Segment, coalesce_to_count, renumber, validate_partition};
 use crate::timemap::{TimeMap, aspiration_k, closure_k};
 use crate::wsola::{self, Anchor, WsolaConfig};
-use crate::{Layers, plosives, sibilants};
+use crate::{Layers, lpc, plosives, sibilants};
 
 /// Everything the renderers need, fixed before synthesis starts.
 pub struct Plan {
@@ -350,25 +350,70 @@ pub fn render(
         .collect();
     let mut cfg = WsolaConfig::new(fs, opts.quality);
     if opts.period_blend {
-        cfg.blend = Some(wsola::BlendConfig::new(fs));
+        cfg.blend = Some(wsola::BlendConfig::new(fs).with_f0(feats.f0_hz.clone(), feats.hop));
     }
     progress.start(Phase::Wsola);
-    let base = wsola::render(
-        work.channels,
+    // LPC residual: whiten each working channel with the mono reference's envelope, let
+    // WSOLA rearrange the residual (grain positions are still chosen on the mono
+    // reference itself), then re-apply the envelope at U(y).
+    let lpc = opts
+        .lpc_residual
+        .then(|| lpc::LpcTrack::analyze(&feats.mono, fs, opts.threads));
+    let threads = crate::par::threads(opts.threads);
+    let resid: Vec<Vec<f32>> = match &lpc {
+        Some(t) => crate::par::map(work.channels.len(), threads, |c| t.whiten(work.channels[c])),
+        None => Vec::new(),
+    };
+    let resid_refs: Vec<&[f32]> = resid.iter().map(Vec::as_slice).collect();
+    let mut base = wsola::render(
+        if lpc.is_some() {
+            &resid_refs
+        } else {
+            work.channels
+        },
         &feats.mono,
         &plan.map,
         &anchors,
         &cfg,
         &mut |d, t| progress.step(Phase::Wsola, d, t),
     );
+    if let Some(t) = &lpc {
+        let colored: Option<Vec<Vec<f32>>> = crate::par::map(base.channels.len(), threads, |c| {
+            t.color(&base.channels[c], &plan.map)
+        })
+        .into_iter()
+        .collect();
+        match colored {
+            Some(ch) => {
+                base.channels = ch;
+                base.stats.lpc_order = t.order as u64;
+            }
+            None => {
+                report.warnings.push(Warning::LpcResidualFallback);
+                base = wsola::render(
+                    work.channels,
+                    &feats.mono,
+                    &plan.map,
+                    &anchors,
+                    &cfg,
+                    &mut |_, _| {},
+                );
+            }
+        }
+    }
     progress.finish(
         Phase::Wsola,
         format!(
-            "{} grains ({} transient{})",
+            "{} grains ({} transient{}{})",
             base.stats.grains,
             base.stats.transient_grains,
             if opts.period_blend {
                 format!(", {} period-blended", base.stats.blended_grains)
+            } else {
+                String::new()
+            },
+            if base.stats.lpc_order > 0 {
+                format!(", LPC residual, order {}", base.stats.lpc_order)
             } else {
                 String::new()
             }

@@ -137,3 +137,34 @@ fn period_blend_is_opt_in_and_keeps_length_and_level() {
         }
     }
 }
+
+#[test]
+fn lpc_residual_is_opt_in_and_keeps_length_and_level() {
+    let fx = synth::utterance_fixture(48_000, 1);
+    let refs = fx.audio.view_refs();
+    let view = AudioView {
+        sample_rate: 48_000,
+        channels: &refs,
+    };
+    for f in ["0.75", "1.5", "3"] {
+        let r = StretchRatio::parse(f).unwrap();
+        let plain = stretch(&view, r, &Options::default()).unwrap();
+        let lpc = stretch(
+            &view,
+            r,
+            &Options {
+                lpc_residual: true,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(plain.report.wsola.as_ref().unwrap().lpc_order, 0);
+        assert!(lpc.report.wsola.as_ref().unwrap().lpc_order > 0);
+        let n = r.target_frames(fx.audio.frames() as u64).unwrap() as usize;
+        assert_eq!(lpc.audio.channels[0].len(), n);
+        assert!(lpc.audio.channels[0].iter().all(|v| v.is_finite()));
+        let level = |x: &[f32]| x.iter().map(|&v| (v as f64).powi(2)).sum::<f64>();
+        let db = 10.0 * (level(&lpc.audio.channels[0]) / level(&plain.audio.channels[0])).log10();
+        assert!(db.abs() < 1.0, "{f}: level changed by {db:.2} dB");
+    }
+}

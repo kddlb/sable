@@ -70,6 +70,10 @@ struct Cli {
     /// periods around each grain's source position instead of repeating one.
     #[arg(long)]
     period_blend: bool,
+    /// Experimental: run WSOLA on the LPC residual and re-apply the spectral envelope at
+    /// each output frame's time-mapped input position.
+    #[arg(long)]
+    lpc_residual: bool,
     /// Formant handling for --pitch.
     #[arg(long, value_enum, default_value_t = Formants::Preserve)]
     formants: Formants,
@@ -186,6 +190,7 @@ fn run(cli: Cli) -> Result<(), String> {
     opts.seed = cli.seed;
     opts.threads = cli.threads;
     opts.period_blend = cli.period_blend;
+    opts.lpc_residual = cli.lpc_residual;
     opts.diagnostics = cli.features;
     opts.quality = match cli.quality {
         Quality::Fast => QualityPreset::Fast,

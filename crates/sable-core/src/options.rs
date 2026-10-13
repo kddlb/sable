@@ -64,6 +64,10 @@ pub struct Options {
     /// as a blend of the two aligned pitch periods around the predicted source position
     /// instead of repeating one period and jumping. Off by default.
     pub period_blend: bool,
+    /// Experimental: run WSOLA on the linear-prediction residual and re-apply the spectral
+    /// envelope at each output frame's time-mapped input position, so formants follow the
+    /// time map smoothly. Off by default.
+    pub lpc_residual: bool,
     /// Worker threads for the parallel stages (`0` = all cores, `1` = calling thread
     /// only). The output is bit-identical for every setting.
     #[serde(skip)]
@@ -86,6 +90,7 @@ impl Default for Options {
             pitch_semitones: 0.0,
             formants: FormantMode::Preserve,
             period_blend: false,
+            lpc_residual: false,
             threads: 0,
         }
     }

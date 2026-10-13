@@ -31,7 +31,7 @@ use sable_core::{FormantMode, MAX_PITCH_SEMITONES, Phase, ProgressEvent, StereoM
 
 use emoji::{emoji_button, emoji_label};
 use player::{Player, Source};
-use wave::{Band, Lane, kind_color};
+use wave::{Activity, Band, Lane, kind_color};
 
 fn main() -> eframe::Result {
     // Usage: sable-gui [file.wav [ratio [semitones]]]  (a ratio processes immediately)
@@ -94,6 +94,7 @@ struct Settings {
     pitch_semitones: f64,
     formants: FormantMode,
     period_blend: bool,
+    lpc_residual: bool,
 }
 
 impl Settings {
@@ -124,6 +125,7 @@ impl Settings {
         o.pitch_semitones = self.pitch_semitones;
         o.formants = self.formants;
         o.period_blend = self.period_blend;
+        o.lpc_residual = self.lpc_residual;
         o
     }
 }
@@ -216,6 +218,8 @@ struct Job {
     log: ProcessLog,
     started: Instant,
     settings: Settings,
+    /// Input frames dropped at each end (the processed range, for the live sweep).
+    trimmed: Trimmed,
 }
 
 /// Delay after the last settings edit before auto-processing starts.
@@ -298,6 +302,7 @@ impl App {
                 pitch_semitones: 0.0,
                 formants: FormantMode::Preserve,
                 period_blend: false,
+                lpc_residual: false,
             },
             format: Format::Float32,
             analyze_rx: None,
@@ -330,6 +335,7 @@ impl App {
                 pitch_semitones: 0.0,
                 formants: FormantMode::Preserve,
                 period_blend: false,
+                lpc_residual: false,
             },
             changed_at: None,
             failed_settings: None,
@@ -475,6 +481,7 @@ impl App {
             log: ProcessLog::default(),
             started: Instant::now(),
             settings: self.settings.clone(),
+            trimmed,
         });
         self.status = "Processing…".into();
     }
@@ -929,6 +936,10 @@ impl App {
                 .on_hover_text(
                     "Where the local slow-down is 1.8× or more, mix the two aligned pitch                      periods around each grain's source position instead of repeating one                      period and skipping ahead. Affects voiced sounds only.",
                 );
+            ui.checkbox(&mut self.settings.lpc_residual, "LPC residual (experimental)")
+                .on_hover_text(
+                    "Stretch the signal with its spectral envelope removed, then put the                      envelope back at each output moment's mapped input time, so formants                      follow the time map smoothly. About twice as slow.",
+                );
             let stereo = self.input.as_ref().is_some_and(|i| i.audio.channels.len() == 2);
             ui.add_enabled_ui(stereo, |ui| {
                 ui.horizontal(|ui| {
@@ -1017,23 +1028,6 @@ impl App {
                     ui.label(format!("{:.1} s", job.started.elapsed().as_secs_f64()));
                 }
             });
-            // Live readout of the running job, else the timings of the shown result.
-            let log = match (&self.process_rx, &self.done) {
-                (Some(job), _) => Some((&job.log, None)),
-                (None, Some(d)) => Some((&d.log, Some(d.elapsed))),
-                _ => None,
-            };
-            if let Some((log, total)) = log
-                && !log.rows.is_empty()
-            {
-                egui::CollapsingHeader::new(match total {
-                    None => "Process (running)".to_string(),
-                    Some(t) => format!("Process ({:.0} ms total)", t.as_secs_f64() * 1000.0),
-                })
-                .id_salt("process_readout")
-                .default_open(true)
-                .show(ui, |ui| log.show(ui));
-            }
             if let Some(d) = &self.done
                 && d.settings != self.settings
             {
@@ -1300,8 +1294,22 @@ impl App {
                     .collect()
             })
             .unwrap_or_default();
+        let activity = self.activity();
+        let processed = self.process_rx.as_ref().map_or((0.0, n_in), |j| {
+            (j.trimmed.leading as f64, n_in - j.trimmed.trailing as f64)
+        });
+        let highlight = |k: EventKind| match activity.as_ref().map(|a| a.2) {
+            Some(Phase::Plosives) => k == EventKind::PlosiveBurst,
+            Some(Phase::Sibilants) => k.is_sibilant(),
+            _ => false,
+        };
         let in_resp = Lane {
             title: "Original",
+            activity: activity.as_ref().map(|(label, f, _)| Activity {
+                label,
+                sweep: f.map(|f| (processed.0, processed.1, f)),
+                highlight: &highlight,
+            }),
             channels: &audio.channels,
             fs: audio.sample_rate,
             view: self.view,
@@ -1363,7 +1371,9 @@ impl App {
                 playhead: playing.filter(|p| p.0 == Source::Result).map(|p| p.1),
                 cursor: Some(self.in_to_out(self.cursor)),
                 shade: &[],
-                dim: false,
+                // The shown result is stale while a new one is being computed.
+                dim: self.process_rx.is_some(),
+                activity: None,
             }
             .show(ui, lane_h);
             lanes.push((out_resp, true));
@@ -1482,6 +1492,48 @@ impl App {
                 self.seek_in(x_in);
             }
         });
+    }
+
+    /// Phase-by-phase readout of the running job, else the timings of the shown result.
+    fn process_readout(&self, ui: &mut egui::Ui) {
+        let log = match (&self.process_rx, &self.done) {
+            (Some(job), _) => Some((&job.log, None)),
+            (None, Some(d)) => Some((&d.log, Some(d.elapsed))),
+            _ => None,
+        };
+        ui.add_space(4.0);
+        match log {
+            Some((log, total)) if !log.rows.is_empty() => {
+                ui.strong(match total {
+                    None => "Process (running)".to_string(),
+                    Some(t) => format!("Process ({:.0} ms total)", t.as_secs_f64() * 1000.0),
+                });
+                ui.separator();
+                egui::ScrollArea::vertical()
+                    .id_salt("process_readout")
+                    .auto_shrink([false, false])
+                    .stick_to_bottom(total.is_none())
+                    .show(ui, |ui| log.show(ui));
+            }
+            _ => {
+                ui.strong("Process");
+                ui.separator();
+                ui.label(RichText::new("Not processed yet.").weak());
+            }
+        }
+    }
+
+    /// What the running job is doing, drawn on the original waveform.
+    fn activity(&self) -> Option<(String, Option<f32>, Phase)> {
+        let job = self.process_rx.as_ref()?;
+        let row = job.log.rows.iter().rev().find(|r| r.took.is_none())?;
+        let sweep = matches!(row.phase, Phase::Wsola | Phase::Formants | Phase::Resample)
+            .then_some(row.fraction);
+        let label = match sweep {
+            Some(f) => format!("{} · {:.0}%", row.phase.label(), f * 100.0),
+            None => format!("{}…", row.phase.label()),
+        };
+        Some((label, sweep, row.phase))
     }
 
     fn bottom_tabs(&mut self, ui: &mut egui::Ui) {
@@ -1940,8 +1992,15 @@ impl eframe::App for App {
             .default_height(230.0)
             .min_height(120.0)
             .show(ctx, |ui| {
-                ui.add_space(4.0);
-                self.bottom_tabs(ui);
+                egui::SidePanel::right("process")
+                    .resizable(true)
+                    .default_width(320.0)
+                    .min_width(200.0)
+                    .show_inside(ui, |ui| self.process_readout(ui));
+                egui::CentralPanel::default().show_inside(ui, |ui| {
+                    ui.add_space(4.0);
+                    self.bottom_tabs(ui);
+                });
             });
         egui::CentralPanel::default().show(ctx, |ui| {
             self.waveforms(ui);

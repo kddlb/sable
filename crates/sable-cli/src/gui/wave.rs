@@ -39,6 +39,16 @@ pub struct Band {
     pub selected: bool,
 }
 
+/// What a running job is doing, drawn over a lane.
+pub struct Activity<'a> {
+    /// Phase name (and percentage), shown as a badge.
+    pub label: &'a str,
+    /// `(start, end, fraction)`: the processed frame range and how far the phase got.
+    pub sweep: Option<(f64, f64, f32)>,
+    /// Bands of these kinds pulse (the events the current phase works on).
+    pub highlight: &'a dyn Fn(EventKind) -> bool,
+}
+
 pub struct Lane<'a> {
     pub title: &'a str,
     pub channels: &'a [Vec<f32>],
@@ -54,6 +64,7 @@ pub struct Lane<'a> {
     /// Input ranges (frames) dropped before processing, drawn darkened.
     pub shade: &'a [(f64, f64)],
     pub dim: bool,
+    pub activity: Option<Activity<'a>>,
 }
 
 pub struct LaneResponse {
@@ -216,6 +227,46 @@ impl Lane<'_> {
                 FontId::proportional(11.0),
                 visuals.weak_text_color(),
             );
+        }
+
+        // Live activity of a running job.
+        if let Some(act) = &self.activity {
+            let accent = Color32::from_rgb(90, 170, 255);
+            let pulse = (0.5 + 0.5 * (ui.input(|i| i.time) * 6.0).sin()) as f32;
+            for b in self.bands.iter().filter(|b| (act.highlight)(b.kind)) {
+                if b.end < v0 || b.start > v1 {
+                    continue;
+                }
+                let r = Rect::from_x_y_ranges(
+                    x_of(b.start).max(rect.left())
+                        ..=x_of(b.end).min(rect.right()).max(x_of(b.start) + 2.0),
+                    rect.y_range(),
+                );
+                let c = kind_color(b.kind);
+                painter.rect_filled(r, 0.0, c.gamma_multiply(0.15 + 0.35 * pulse));
+                painter.rect_stroke(r, 0.0, Stroke::new(1.5_f32, c), egui::StrokeKind::Inside);
+            }
+            if let Some((a, b, f)) = act.sweep {
+                let at = a + f as f64 * (b - a);
+                if at > v0 {
+                    let r = Rect::from_x_y_ranges(
+                        x_of(a.max(v0)).max(rect.left())..=x_of(at.min(v1)).min(rect.right()),
+                        rect.y_range(),
+                    );
+                    painter.rect_filled(r, 0.0, accent.gamma_multiply(0.12));
+                }
+                if at >= v0 && at <= v1 {
+                    painter.vline(x_of(at), rect.y_range(), Stroke::new(2.0_f32, accent));
+                }
+            }
+            let font = FontId::proportional(12.0);
+            let galley = painter.layout_no_wrap(act.label.to_string(), font, Color32::WHITE);
+            let badge = Rect::from_min_size(
+                Pos2::new(rect.right() - galley.size().x - 18.0, rect.top() + 6.0),
+                galley.size() + Vec2::new(12.0, 6.0),
+            );
+            painter.rect_filled(badge, 4.0, accent.gamma_multiply(0.85));
+            painter.galley(badge.min + Vec2::new(6.0, 3.0), galley, Color32::WHITE);
         }
 
         // Cursor and playhead.

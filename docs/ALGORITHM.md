@@ -333,25 +333,65 @@ period back.
 With blending on, a grain whose local factor is at least 1.8 (outside burst zones) is
 built from **two** source positions instead of one:
 
-1. The normal best match `c*` fixes the phase. The strongest other correlation peak 2–16 ms
-   away gives the local pitch period `T`.
+1. The local pitch period `T` comes from the analysis F0 track (§3) where that frame is
+   voiced. The search for the best match `c*` is then kept within `T/2` of the time
+   map's position `U(y)`. Without that limit, at strong slow-downs the overlap always
+   favours "play on", so the search drifts to its +8 ms edge and loops one chunk; at
+   150× this showed up as a staircase in the waveform envelope. Where the track has no
+   period, `T` is the strongest other correlation peak 2–16 ms from `c*`, and the search
+   keeps its usual width.
 2. Positions in phase with the output lie on the lattice `c* + k·T`. The two lattice
-   points `before ≤ U(y) ≤ after` that bracket the time map's position are refined at full
-   resolution.
-3. If each still matches the overlap (correlation ≥ 0.5) and the two source grains match
-   each other (≥ 0.7), the grain is `(1 − α)·before + α·after`, with
-   `α = (U(y) − before) / T`, scaled by `1 / √((1−α)² + α² + 2α(1−α)ρ)` to keep its power.
-   Otherwise the plain choice is used.
+   points `before ≤ U(y) ≤ after` that bracket the time map's position are refined
+   (by `±T/16` for a tracked period).
+3. The grain is `(1 − α)·before + α·after`, with `α = (U(y) − before) / T`, scaled by
+   `1 / √((1−α)² + α² + 2α(1−α)ρ)` to keep its power (`ρ` is the correlation of the two
+   source grains). For a tracked period the pair is refused only if a candidate or the
+   pair is out of phase (correlation below 0). For a correlation-estimated period each
+   must still match the overlap at 0.5 or better and each other at 0.7. A refused grain
+   uses the plain choice.
 
 The output then follows the time map continuously, morphing from one period into the
-next instead of repeating and skipping. On the local recordings at 3×, 67–96 % of the
-grains in voiced segments blend (almost none elsewhere), and the share of grains whose
-source step departs from the time map's by more than 2 ms falls from 44–92 % to 14–33 %
-on three speech recordings (2 % remain on a sung vocal).
-Measured side effects are small: about 0.1–0.3 dB less energy above 3 kHz relative to
-below 1 kHz, and a level change within ±0.3 dB. WSOLA takes about 3× as long when blending
+next instead of repeating and skipping. Only voiced sound has a period to morph: at very
+large factors, unvoiced stretches other than resynthesized sibilants (breaths, /h/,
+/f/) still repeat a short chunk.
+
+Measured with `examples/blend_eval` on the local recordings at 2–4×: 40–82 % of grains
+blend (17–78 % before the F0 track was used), and the period-to-period similarity swing
+drops slightly further. Side effects: the energy above 3 kHz relative to below 1 kHz
+falls by 0.2–0.6 dB, and the level changes by up to +0.5 dB. On a 150× stretch of a
+TTS voice, 71 % of grains blend (52 % before), and the largest 10 ms envelope step in a
+voiced passage falls from 3.1 dB to 0.9 dB. WSOLA takes about 3× as long when blending
 is on. Whether it sounds better has not been judged by listening yet;
 `examples/blend_eval` renders an A/B set.
+
+**Experimental: WSOLA on the LPC residual** (`Options::lpc_residual`, `--lpc-residual`,
+off by default; `lpc.rs`). Plain WSOLA copies each grain's spectral envelope from
+wherever its source position landed, up to ±8 ms off the time map, and when two
+overlapping grains come from slightly different moments their formants are averaged.
+With this option the envelope is separated from the waveform first:
+
+1. The mono reference is pre-emphasized (`1 − 0.9 z⁻¹`) and analysed every 5 ms (25 ms
+   Hann window, autocorrelation, 60 Hz Gaussian lag window, −40 dB noise floor).
+   Levinson–Durbin gives reflection coefficients; the order is `fs/1000 + 4`, 10–32.
+2. Every working channel is pre-emphasized and whitened by an FIR lattice. The
+   coefficients are interpolated linearly per sample between frames, and every channel
+   uses the same envelope.
+3. WSOLA renders the **residual**. Grain positions are still chosen on the mono
+   reference, so they are exactly the plain renderer's.
+4. Output frame `y` is coloured by the matching IIR lattice with the coefficients at
+   `U(y)`, then de-emphasized. Interpolated reflection coefficients always give a stable
+   filter, and analysis and synthesis are exact inverses on an identity map. A
+   non-finite result falls back to plain WSOLA (`LpcResidualFallback`).
+
+The envelope then follows the time map continuously. Pitch-period repeats and skips are
+unchanged; combine with `period_blend` for those. `examples/lpc_eval` measures the
+envelope independently of LPC (third-octave bands of the output at `y` compared with the
+input at `U(y)`). On the local recordings that tracking error falls by 0.1–0.4 dB on
+most inputs and factors (up to 0.9 dB on the synthetic utterance), rises by up to
+0.25 dB on one recording, and frame-to-frame jitter is unchanged. Level and high-band
+balance stay within ±0.5 dB. Rendering takes about 1.5–2× as long. Choosing grains on
+the residual instead was tried: it tracked the envelope better but jittered more and
+lost up to 0.7 dB of level, so it was not kept. It has not been judged by listening yet.
 
 Grain positions follow the time map, so WSOLA stretches each segment by its own budgeted
 amount. That is the "variable rate".
@@ -525,7 +565,7 @@ commit, and run WSOLA over a ring buffer. That is not implemented.
 | event detection, burst scoring | `detect.rs`, `segments.rs` |
 | duration budget | `budget.rs` |
 | time map and warps | `timemap.rs` |
-| WSOLA | `wsola.rs` |
+| WSOLA, LPC residual | `wsola.rs`, `lpc.rs` |
 | burst copy | `plosives.rs` |
 | sibilant template and noise | `sibilants.rs`, `stereo.rs`, `filters.rs`, `rng.rs` |
 | orchestration, mid/side | `pipeline.rs` |

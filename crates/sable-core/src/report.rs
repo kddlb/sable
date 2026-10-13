@@ -44,6 +44,8 @@ pub enum Warning {
     },
     /// Output samples not covered by any grain were filled by the safe fallback.
     UncoveredSamplesFilled { count: u64 },
+    /// LPC-residual rendering produced a non-finite result; plain WSOLA was used instead.
+    LpcResidualFallback,
     /// A special renderer was disabled for a segment; see the overlay list.
     SpecialRendererDisabled { segment_id: usize, reason: String },
 }
@@ -87,6 +89,9 @@ pub struct WsolaStats {
     /// ([`crate::Options::period_blend`]).
     #[serde(skip_serializing_if = "is_zero")]
     pub blended_grains: u64,
+    /// Prediction order when WSOLA ran on the LPC residual ([`crate::Options::lpc_residual`]).
+    #[serde(skip_serializing_if = "is_zero")]
+    pub lpc_order: u64,
 }
 
 fn is_zero(v: &u64) -> bool {

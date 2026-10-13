@@ -31,6 +31,7 @@ pub mod features;
 pub mod fft;
 pub mod filters;
 pub mod formant;
+pub mod lpc;
 pub mod metrics;
 pub mod options;
 pub mod par;
